@@ -254,7 +254,7 @@ class CallTools:
             business = db.get_business(self.business_id)
             if business and business.get("whatsapp_instance"):
                 sent = await send_whatsapp_message(
-                    instance=business["whatsapp_instance"],
+                    instance_id=business["whatsapp_instance"],
                     token=business.get("whatsapp_token", ""),
                     phone=self.phone,
                     message=message,

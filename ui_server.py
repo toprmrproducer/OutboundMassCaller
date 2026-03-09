@@ -6,10 +6,11 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import File, FastAPI, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import File, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from livekit import api as lk_api
@@ -31,13 +32,33 @@ app.add_middleware(
 )
 
 
+_live_clients: set[WebSocket] = set()
+_live_filters: dict[WebSocket, Optional[str]] = {}
+_live_broadcast_task: Optional[asyncio.Task] = None
+_scheduled_campaigns_task: Optional[asyncio.Task] = None
+_import_jobs: dict[str, dict] = {}
+
+
+def _success(data):
+    return {"data": data, "error": None}
+
+
+def _error(message: str, status_code: int = 400):
+    return JSONResponse(status_code=status_code, content={"data": None, "error": message})
+
+
 @app.on_event("startup")
 async def startup_event():
+    global _live_broadcast_task, _scheduled_campaigns_task
     try:
         db.initdb()
         logging.info("STARTUP: DB init complete")
     except Exception as e:
         logging.warning(f"STARTUP: DB init failed: {e}")
+    if _live_broadcast_task is None or _live_broadcast_task.done():
+        _live_broadcast_task = asyncio.create_task(_live_broadcast_loop())
+    if _scheduled_campaigns_task is None or _scheduled_campaigns_task.done():
+        _scheduled_campaigns_task = asyncio.create_task(_scheduled_campaign_autostart_loop())
 
 
 class BusinessCreate(BaseModel):
@@ -217,6 +238,29 @@ class DemoStartBody(BaseModel):
     business_id: str
 
 
+class DNCAddBody(BaseModel):
+    business_id: str
+    phone: str
+    reason: Optional[str] = None
+    added_by: str = "api"
+
+
+class DNCBulkBody(BaseModel):
+    business_id: str
+    phones: List[str]
+    reason: Optional[str] = None
+
+
+class VariantItem(BaseModel):
+    agent_id: str
+    weight: int
+
+
+class VariantSetBody(BaseModel):
+    business_id: str
+    variants: List[VariantItem]
+
+
 def _lk_client() -> lk_api.LiveKitAPI:
     return lk_api.LiveKitAPI(
         url=os.environ["LIVEKIT_URL"],
@@ -227,6 +271,13 @@ def _lk_client() -> lk_api.LiveKitAPI:
 
 def _normalize_phone(phone: str) -> str:
     return (phone or "").strip().replace(" ", "")
+
+
+_PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
+
+
+def _is_valid_phone(phone: str) -> bool:
+    return bool(_PHONE_RE.match(phone or ""))
 
 
 async def dispatch_outbound_call(
@@ -299,6 +350,46 @@ def _extract_pdf_text(data: bytes) -> str:
     if parts:
         return "\n".join(parts)
     return ""
+
+
+async def _live_broadcast_loop():
+    while True:
+        try:
+            if not _live_clients:
+                await asyncio.sleep(2)
+                continue
+            stale = []
+            for ws in list(_live_clients):
+                business_id = _live_filters.get(ws)
+                payload = db.get_live_monitor_snapshot(business_id=business_id)
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    stale.append(ws)
+            for ws in stale:
+                _live_clients.discard(ws)
+                _live_filters.pop(ws, None)
+            await asyncio.sleep(2)
+        except Exception as e:
+            logging.error("[WS] live broadcast loop error: %s", e)
+            await asyncio.sleep(2)
+
+
+async def _scheduled_campaign_autostart_loop():
+    while True:
+        try:
+            due = db.get_campaigns_due_to_start()
+            if due:
+                import dialer
+
+                for campaign in due:
+                    cid = str(campaign["id"])
+                    db.update_campaign(cid, status="active", started_at=datetime_now_iso())
+                    asyncio.create_task(dialer.start_campaign(cid))
+                    logging.info("[SCHEDULER] Auto-started campaign %s", cid)
+        except Exception as e:
+            logging.error("[SCHEDULER] auto-start loop error: %s", e)
+        await asyncio.sleep(60)
 
 
 # Businesses
@@ -509,6 +600,36 @@ async def stop_campaign(id: str):
     return {"status": "stopped"}
 
 
+@app.get("/api/campaigns/{id}/variants")
+def get_campaign_variants(id: str, business_id: str = Query(...)):
+    logging.info("[AB] get variants campaign_id=%s business_id=%s", id, business_id)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_campaign_variants(id))
+
+
+@app.post("/api/campaigns/{id}/variants")
+def set_campaign_variants(id: str, body: VariantSetBody):
+    logging.info("[AB] set variants campaign_id=%s business_id=%s", id, body.business_id)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    ok = db.set_campaign_variants(id, [v.model_dump() for v in body.variants])
+    if not ok:
+        return _error("Failed to set variants; weights must sum to 100", 400)
+    return _success({"saved": True})
+
+
+@app.get("/api/campaigns/{id}/variant-stats")
+def get_variant_stats(id: str, business_id: str = Query(...)):
+    logging.info("[AB] variant-stats campaign_id=%s business_id=%s", id, business_id)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_campaign_variant_stats(id))
+
+
 # Leads
 
 @app.post("/api/campaigns/{id}/leads/upload")
@@ -551,6 +672,87 @@ async def upload_leads(id: str, file: UploadFile = File(...)):
     return {"inserted": inserted}
 
 
+@app.post("/api/campaigns/{campaign_id}/leads/import")
+async def import_leads(campaign_id: str, business_id: str = Query(...), file: UploadFile = File(...)):
+    logging.info("[LEADS] import requested campaign_id=%s business_id=%s", campaign_id, business_id)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign:
+        return _error("Campaign not found", 404)
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        return _error("File too large (max 10MB)", 400)
+
+    text = content.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(io.StringIO(text))
+
+    errors = []
+    imported_rows = []
+    seen_csv = set()
+    duplicates_skipped = 0
+    dnc_skipped = 0
+    invalid_skipped = 0
+
+    existing_phones = {(_normalize_phone(x.get("phone")) or "") for x in db.get_leads(campaign_id, limit=50000, offset=0)}
+    row_idx = 1
+    for row in reader:
+        row_idx += 1
+        if row_idx > 50001:
+            return _error("Max 50,000 rows allowed", 400)
+
+        phone = _normalize_phone(row.get("phone") or "")
+        if not phone or not _is_valid_phone(phone):
+            invalid_skipped += 1
+            errors.append({"row": row_idx, "phone": phone, "reason": "invalid_phone"})
+            continue
+        if phone in seen_csv or phone in existing_phones:
+            duplicates_skipped += 1
+            continue
+        if db.is_dnc(str(business_id), phone):
+            dnc_skipped += 1
+            continue
+        seen_csv.add(phone)
+
+        custom_data = {}
+        raw_custom = row.get("custom_data")
+        if raw_custom:
+            try:
+                custom_data = json.loads(raw_custom)
+            except Exception:
+                custom_data = {"raw": raw_custom}
+        imported_rows.append(
+            {
+                "phone": phone,
+                "name": row.get("name"),
+                "email": row.get("email"),
+                "language": row.get("language") or "hi-IN",
+                "custom_data": custom_data,
+            }
+        )
+
+    inserted = db.bulk_create_leads(campaign_id, business_id, imported_rows)
+    result = {
+        "imported": inserted,
+        "duplicates_skipped": duplicates_skipped,
+        "dnc_skipped": dnc_skipped,
+        "invalid_skipped": invalid_skipped,
+        "errors": errors,
+    }
+    job_id = uuid.uuid4().hex
+    _import_jobs[job_id] = {"status": "completed", "result": result, "created_at": datetime.utcnow().isoformat()}
+    result["job_id"] = job_id
+    return _success(result)
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, business_id: str = Query(...)):
+    _ = business_id
+    row = _import_jobs.get(job_id)
+    if not row:
+        return _error("Job not found", 404)
+    return _success(row)
+
+
 @app.get("/api/campaigns/{id}/leads")
 def get_campaign_leads(id: str, status: Optional[str] = Query(default=None), limit: int = 100, offset: int = 0):
     return db.get_leads(id, status=status, limit=limit, offset=offset)
@@ -570,6 +772,40 @@ def reschedule_lead(body: RescheduleLeadBody):
     if not ok:
         raise HTTPException(status_code=400, detail="Failed to reschedule lead")
     return {"success": True}
+
+
+# DNC Registry
+
+@app.post("/api/dnc")
+def add_dnc(body: DNCAddBody):
+    logging.info("[DNC] add phone=%s business_id=%s", body.phone, body.business_id)
+    row = db.add_to_dnc(body.business_id, body.phone, body.reason, body.added_by)
+    if not row:
+        return _error("Failed to add DNC", 400)
+    return _success(row)
+
+
+@app.post("/api/dnc/bulk")
+def add_dnc_bulk(body: DNCBulkBody):
+    logging.info("[DNC] bulk add business_id=%s count=%s", body.business_id, len(body.phones))
+    count = db.bulk_add_dnc(body.business_id, body.phones, body.reason)
+    return _success({"added": count})
+
+
+@app.get("/api/dnc")
+def list_dnc(business_id: str = Query(...), limit: int = 100, offset: int = 0):
+    logging.info("[DNC] list business_id=%s", business_id)
+    rows = db.get_dnc_list(business_id, limit=limit, offset=offset)
+    return _success(rows)
+
+
+@app.delete("/api/dnc/{phone}")
+def remove_dnc(phone: str, business_id: str = Query(...)):
+    logging.info("[DNC] remove phone=%s business_id=%s", phone, business_id)
+    ok = db.remove_from_dnc(business_id, phone)
+    if not ok:
+        return _error("DNC entry not found", 404)
+    return _success({"removed": True})
 
 
 # Calls
@@ -822,22 +1058,66 @@ def get_active_calls(business_id: Optional[str] = Query(default=None)):
     return db.get_active_calls(business_id=business_id)
 
 
+@app.get("/api/analytics/funnel")
+def analytics_funnel(campaign_id: str = Query(...), business_id: str = Query(...)):
+    logging.info("[ANALYTICS] funnel campaign_id=%s business_id=%s", campaign_id, business_id)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_conversion_funnel(campaign_id))
+
+
+@app.get("/api/analytics/hourly")
+def analytics_hourly(campaign_id: str = Query(...), date: str = Query(...), business_id: str = Query(...)):
+    logging.info("[ANALYTICS] hourly campaign_id=%s date=%s business_id=%s", campaign_id, date, business_id)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_campaign_hourly_stats(campaign_id, date))
+
+
+@app.get("/api/analytics/disposition")
+def analytics_disposition(campaign_id: str = Query(...), business_id: str = Query(...)):
+    logging.info("[ANALYTICS] disposition campaign_id=%s business_id=%s", campaign_id, business_id)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_disposition_breakdown(campaign_id))
+
+
+@app.get("/api/analytics/agent-performance")
+def analytics_agent_performance(business_id: str = Query(...), days: int = Query(7, ge=1, le=90)):
+    logging.info("[ANALYTICS] agent-performance business_id=%s days=%s", business_id, days)
+    return _success(db.get_agent_performance(business_id, days=days))
+
+
+@app.get("/api/analytics/cost")
+def analytics_cost(
+    business_id: str = Query(...),
+    from_date: str = Query(..., alias="from"),
+    to_date: str = Query(..., alias="to"),
+):
+    logging.info("[ANALYTICS] cost business_id=%s from=%s to=%s", business_id, from_date, to_date)
+    return _success(db.get_cost_report(business_id, from_date, to_date))
+
+
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await ws.accept()
+    business_id = ws.query_params.get("business_id")
+    _live_clients.add(ws)
+    _live_filters[ws] = business_id
     try:
+        await ws.send_json(db.get_live_monitor_snapshot(business_id=business_id))
         while True:
-            active = db.get_active_calls()
-            stats = db.get_platform_stats()
-            await ws.send_json({"active_calls": active, "stats": stats})
-            await asyncio.sleep(2)
+            await ws.receive_text()
     except WebSocketDisconnect:
-        return
+        pass
     except Exception:
-        try:
-            await ws.close()
-        except Exception:
-            return
+        pass
+    finally:
+        _live_clients.discard(ws)
+        _live_filters.pop(ws, None)
 
 
 # Demo
@@ -869,6 +1149,37 @@ async def demo_start(body: DemoStartBody):
         return {"room_name": room_name, "token": token, "livekit_url": os.environ["LIVEKIT_URL"]}
     finally:
         await lk.aclose()
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    payload = await request.json()
+    business_id = str(payload.get("business_id") or request.query_params.get("business_id") or "")
+    if not business_id:
+        return _error("business_id is required", 400)
+
+    text = (
+        payload.get("message")
+        or payload.get("text")
+        or ((payload.get("data") or {}).get("message") if isinstance(payload.get("data"), dict) else "")
+        or ""
+    )
+    phone = (
+        payload.get("phone")
+        or payload.get("from")
+        or ((payload.get("data") or {}).get("from") if isinstance(payload.get("data"), dict) else "")
+        or ""
+    )
+    phone = _normalize_phone(phone).replace("@s.whatsapp.net", "")
+    if phone and not phone.startswith("+"):
+        phone = f"+{phone}"
+
+    if "stop" in str(text).lower() and phone:
+        row = db.add_to_dnc(business_id, phone, "whatsapp_stop", "whatsapp_webhook")
+        if row:
+            logging.info("[WHATSAPP] STOP received and added to DNC phone=%s business_id=%s", phone, business_id)
+            return _success({"dnc_added": True, "phone": phone})
+    return _success({"dnc_added": False})
 
 
 def datetime_now_iso() -> str:

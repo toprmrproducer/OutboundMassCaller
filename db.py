@@ -7,44 +7,21 @@ from datetime import datetime
 
 import psycopg2
 import pytz
-import threading
-from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor, execute_values
 
 logger = logging.getLogger("db")
 
 
-_pool: pg_pool.ThreadedConnectionPool | None = None
-_pool_lock = threading.Lock()
-
-
-def _get_pool() -> pg_pool.ThreadedConnectionPool:
-    global _pool
-    if _pool is not None:
-        return _pool
-    with _pool_lock:
-        if _pool is not None:
-            return _pool
-        database_url = os.environ["DATABASE_URL"]
-        _pool = pg_pool.ThreadedConnectionPool(
-            minconn=int(os.environ.get("DB_POOL_MIN", "2")),
-            maxconn=int(os.environ.get("DB_POOL_MAX", "20")),
-            dsn=database_url,
-            cursor_factory=RealDictCursor,
-        )
-        logger.info("[DB] Connection pool initialised (min=2, max=20)")
-        return _pool
-
-
 def get_conn():
-    """Get a connection from the pool."""
-    return _get_pool().getconn()
+    """Open a new PostgreSQL connection for each operation."""
+    database_url = os.environ["DATABASE_URL"]
+    return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
 
 
 def release_conn(conn):
-    """Return a connection to the pool."""
+    """Close a connection."""
     try:
-        _get_pool().putconn(conn)
+        conn.close()
     except Exception as e:
         logger.warning("[DB] release_conn failed: %s", e)
 
@@ -78,15 +55,16 @@ def _update_statement(data: dict, allowed: set[str]) -> tuple[str, list]:
 
 
 def initdb():
-    sql = """
-    -- NOTE: pgcrypto and vector extensions must be enabled
-    -- manually in Supabase Dashboard before first run.
-    -- Dashboard -> Database -> Extensions -> enable:
-    --   1. pgcrypto
-    --   2. vector (pgvector)
-    -- Do NOT attempt to create extensions from application code
-    -- as Supabase restricts this to dashboard/superuser only.
+    # NOTE: pgcrypto and vector must be enabled in Supabase Dashboard first:
+    # Dashboard -> Database -> Extensions -> enable pgcrypto + vector
+    # Each extension is attempted separately - a failure logs WARNING only
+    # and does NOT block table creation or crash the app.
+    _extensions = [
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        "CREATE EXTENSION IF NOT EXISTS vector",
+    ]
 
+    _tables_sql = """
     CREATE TABLE IF NOT EXISTS businesses (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
@@ -155,6 +133,8 @@ def initdb():
       call_window_end TEXT DEFAULT '20:00',
       timezone TEXT DEFAULT 'Asia/Kolkata',
       custom_script TEXT,
+      skip_sundays BOOLEAN DEFAULT true,
+      retry_strategy JSONB DEFAULT '{"no_answer": {"delay_minutes": 30, "max_attempts": 3}, "busy": {"delay_minutes": 15, "max_attempts": 5}, "failed": {"delay_minutes": 60, "max_attempts": 2}, "voicemail": {"delay_minutes": 240, "max_attempts": 1}, "best_time_window": {"start": "10:00", "end": "18:00"}}'::jsonb,
       scheduled_start_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now(),
       started_at TIMESTAMPTZ,
@@ -257,6 +237,17 @@ def initdb():
       last_updated TIMESTAMPTZ DEFAULT now()
     );
 
+    CREATE TABLE IF NOT EXISTS dnc_list (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      phone TEXT NOT NULL,
+      reason TEXT,
+      added_by TEXT DEFAULT 'system',
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(business_id, phone)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dnc_phone ON dnc_list(phone);
+
     CREATE TABLE IF NOT EXISTS knowledge_base (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
@@ -279,21 +270,51 @@ def initdb():
       created_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_scheduled_callbacks_due ON scheduled_callbacks(scheduled_for, status);
+
+    CREATE TABLE IF NOT EXISTS campaign_agent_variants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      campaign_id UUID REFERENCES campaigns(id) ON DELETE CASCADE,
+      agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+      weight INT DEFAULT 50,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
     """
+
     conn = None
     try:
         conn = get_conn()
+
+        for ext_stmt in _extensions:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(ext_stmt)
+                conn.commit()
+                logger.info("[DB] Extension ready: %s", ext_stmt)
+            except Exception as ext_err:
+                conn.rollback()
+                logger.warning(
+                    "[DB] Extension skipped - enable in Supabase Dashboard "
+                    "-> Database -> Extensions: %s", ext_err
+                )
+
         with conn, conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(_tables_sql)
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS skip_sundays BOOLEAN DEFAULT true")
+            cur.execute(
+                """
+                ALTER TABLE campaigns
+                ADD COLUMN IF NOT EXISTS retry_strategy JSONB DEFAULT
+                '{"no_answer": {"delay_minutes": 30, "max_attempts": 3}, "busy": {"delay_minutes": 15, "max_attempts": 5}, "failed": {"delay_minutes": 60, "max_attempts": 2}, "voicemail": {"delay_minutes": 240, "max_attempts": 1}, "best_time_window": {"start": "10:00", "end": "18:00"}}'::jsonb
+                """
+            )
+
         logger.info("[DB] Tables initialized")
     except Exception as e:
         logger.exception("[DB] initdb failed: %s", e)
         raise
     finally:
         if conn is not None:
-            release_conn(conn)
-
-
+            conn.close()
 # Businesses
 
 def create_business(name, description=None, website=None, timezone="Asia/Kolkata", whatsapp_instance=None, whatsapp_token=None):
@@ -740,6 +761,8 @@ def create_campaign(**kwargs):
         "call_window_end": "20:00",
         "timezone": "Asia/Kolkata",
         "custom_script": None,
+        "skip_sundays": True,
+        "retry_strategy": None,
         "scheduled_start_at": None,
         "started_at": None,
         "completed_at": None,
@@ -756,12 +779,13 @@ def create_campaign(**kwargs):
                 (business_id, agent_id, sip_trunk_id, name, description, objective,
                  status, calls_per_minute, max_concurrent_calls, retry_failed,
                  max_retries, retry_delay_minutes, call_window_start, call_window_end,
-                 timezone, custom_script, scheduled_start_at, started_at, completed_at)
+                 timezone, custom_script, skip_sundays, retry_strategy,
+                 scheduled_start_at, started_at, completed_at)
                 VALUES
                 (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s,
                  %s, %s, %s, %s,
                  %s, %s, %s, %s,
-                 %s, %s, %s, %s, %s)
+                 %s, %s, %s, %s::jsonb, %s, %s, %s)
                 RETURNING *
                 """,
                 (
@@ -769,7 +793,9 @@ def create_campaign(**kwargs):
                     defaults["name"], defaults["description"], defaults["objective"],
                     defaults["status"], defaults["calls_per_minute"], defaults["max_concurrent_calls"], defaults["retry_failed"],
                     defaults["max_retries"], defaults["retry_delay_minutes"], defaults["call_window_start"], defaults["call_window_end"],
-                    defaults["timezone"], defaults["custom_script"], defaults["scheduled_start_at"], defaults["started_at"], defaults["completed_at"],
+                    defaults["timezone"], defaults["custom_script"], defaults["skip_sundays"],
+                    json.dumps(defaults["retry_strategy"]) if defaults["retry_strategy"] else None,
+                    defaults["scheduled_start_at"], defaults["started_at"], defaults["completed_at"],
                 ),
             )
             return _dict(cur.fetchone())
@@ -819,7 +845,7 @@ def update_campaign(id, **kwargs):
         "name", "description", "objective", "agent_id", "sip_trunk_id", "status",
         "calls_per_minute", "max_concurrent_calls", "retry_failed", "max_retries",
         "retry_delay_minutes", "call_window_start", "call_window_end", "timezone",
-        "custom_script", "scheduled_start_at", "started_at", "completed_at",
+        "custom_script", "skip_sundays", "retry_strategy", "scheduled_start_at", "started_at", "completed_at",
     }
     update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not update_data:
@@ -830,6 +856,9 @@ def update_campaign(id, **kwargs):
     for k, v in update_data.items():
         if isinstance(v, str) and v.lower() == "now()":
             cols.append(f"{k}=NOW()")
+        elif k == "retry_strategy":
+            cols.append("retry_strategy=%s::jsonb")
+            vals.append(json.dumps(v))
         else:
             cols.append(f"{k}=%s")
             vals.append(v)
@@ -843,6 +872,69 @@ def update_campaign(id, **kwargs):
     except Exception as e:
         logger.exception("update_campaign failed: %s", e)
         return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaigns_due_to_start():
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM campaigns
+                WHERE status='scheduled'
+                  AND scheduled_start_at IS NOT NULL
+                  AND scheduled_start_at <= NOW()
+                ORDER BY scheduled_start_at ASC
+                """
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaigns_due_to_start failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaigns_active():
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM campaigns WHERE status='active' ORDER BY started_at DESC NULLS LAST, created_at DESC")
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaigns_active failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_retry_config(campaign_id, disposition):
+    default_cfg = {"delay_minutes": 60, "max_attempts": 2}
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT retry_strategy FROM campaigns WHERE id=%s::uuid LIMIT 1", (campaign_id,))
+            row = cur.fetchone()
+            if not row:
+                return default_cfg
+            strategy = row.get("retry_strategy") or {}
+            if isinstance(strategy, str):
+                try:
+                    strategy = json.loads(strategy)
+                except Exception:
+                    strategy = {}
+            return strategy.get(disposition) or strategy.get("failed") or default_cfg
+    except Exception as e:
+        logger.exception("get_retry_config failed: %s", e)
+        return default_cfg
     finally:
         if conn is not None:
             release_conn(conn)
@@ -913,6 +1005,117 @@ def get_campaign_stats(campaign_id):
     except Exception as e:
         logger.exception("get_campaign_stats failed: %s", e)
         return empty
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def set_campaign_variants(campaign_id, variants):
+    conn = None
+    try:
+        total_weight = sum(int(v.get("weight") or 0) for v in variants or [])
+        if total_weight != 100:
+            logger.error("set_campaign_variants failed: weights must sum to 100")
+            return False
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM campaign_agent_variants WHERE campaign_id=%s::uuid", (campaign_id,))
+            values = [(campaign_id, v["agent_id"], int(v["weight"])) for v in variants]
+            execute_values(
+                cur,
+                """
+                INSERT INTO campaign_agent_variants (campaign_id, agent_id, weight)
+                VALUES %s
+                """,
+                values,
+                template="(%s::uuid,%s::uuid,%s)",
+            )
+            return True
+    except Exception as e:
+        logger.exception("set_campaign_variants failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_variants(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cav.*, a.name AS agent_name
+                FROM campaign_agent_variants cav
+                LEFT JOIN agents a ON a.id = cav.agent_id
+                WHERE cav.campaign_id=%s::uuid
+                ORDER BY cav.created_at ASC
+                """,
+                (campaign_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaign_variants failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def pick_variant_agent(campaign_id):
+    conn = None
+    try:
+        variants = get_campaign_variants(campaign_id)
+        if variants:
+            total = sum(max(int(v.get("weight") or 0), 0) for v in variants)
+            if total > 0:
+                pick = random.randint(1, total)
+                running = 0
+                for variant in variants:
+                    running += max(int(variant.get("weight") or 0), 0)
+                    if pick <= running:
+                        return str(variant["agent_id"])
+        campaign = get_campaign(campaign_id)
+        if campaign and campaign.get("agent_id"):
+            return str(campaign["agent_id"])
+        return ""
+    except Exception as e:
+        logger.exception("pick_variant_agent failed: %s", e)
+        return ""
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_variant_stats(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.agent_id,
+                    COALESCE(a.name, 'Unknown') AS agent_name,
+                    COUNT(*)::int AS total_calls,
+                    COUNT(*) FILTER (WHERE c.was_booked = true)::int AS booked_count,
+                    COALESCE(AVG(c.duration_seconds), 0)::int AS avg_duration,
+                    CASE WHEN COUNT(*) = 0 THEN 0
+                         ELSE ROUND((COUNT(*) FILTER (WHERE c.was_booked = true)::numeric / COUNT(*)::numeric) * 100, 2)
+                    END AS conversion_rate
+                FROM calls c
+                LEFT JOIN agents a ON a.id = c.agent_id
+                WHERE c.campaign_id=%s::uuid
+                GROUP BY c.agent_id, a.name
+                ORDER BY total_calls DESC
+                """,
+                (campaign_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaign_variant_stats failed: %s", e)
+        return []
     finally:
         if conn is not None:
             release_conn(conn)
@@ -1218,6 +1421,126 @@ def reschedule_lead(lead_id, next_call_at, script_id=None, reason=None):
     except Exception as e:
         logger.exception("reschedule_lead failed: %s", e)
         return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# DNC Registry
+
+def add_to_dnc(business_id, phone, reason=None, added_by="system"):
+    conn = None
+    try:
+        clean_phone = _clean_phone(phone)
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dnc_list (business_id, phone, reason, added_by)
+                VALUES (%s::uuid, %s, %s, %s)
+                ON CONFLICT (business_id, phone)
+                DO UPDATE SET reason=EXCLUDED.reason, added_by=EXCLUDED.added_by
+                RETURNING *
+                """,
+                (business_id, clean_phone, reason, added_by),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("add_to_dnc failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def remove_from_dnc(business_id, phone):
+    conn = None
+    try:
+        clean_phone = _clean_phone(phone)
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM dnc_list WHERE business_id=%s::uuid AND phone=%s", (business_id, clean_phone))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("remove_from_dnc failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def is_dnc(business_id, phone):
+    conn = None
+    try:
+        clean_phone = _clean_phone(phone)
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM dnc_list WHERE business_id=%s::uuid AND phone=%s LIMIT 1",
+                (business_id, clean_phone),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        logger.exception("is_dnc failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_add_dnc(business_id, phones, reason=None):
+    conn = None
+    try:
+        clean_phones = []
+        seen = set()
+        for p in phones or []:
+            cp = _clean_phone(p)
+            if cp and cp not in seen:
+                clean_phones.append(cp)
+                seen.add(cp)
+        if not clean_phones:
+            return 0
+
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            values = [(business_id, p, reason, "bulk_upload") for p in clean_phones]
+            execute_values(
+                cur,
+                """
+                INSERT INTO dnc_list (business_id, phone, reason, added_by)
+                VALUES %s
+                ON CONFLICT (business_id, phone) DO NOTHING
+                """,
+                values,
+                template="(%s::uuid,%s,%s,%s)",
+            )
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    except Exception as e:
+        logger.exception("bulk_add_dnc failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_dnc_list(business_id, limit=100, offset=0):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM dnc_list
+                WHERE business_id=%s::uuid
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (business_id, limit, offset),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_dnc_list failed: %s", e)
+        return []
     finally:
         if conn is not None:
             release_conn(conn)
@@ -1753,6 +2076,276 @@ def delete_knowledge_item(id):
     except Exception as e:
         logger.exception("delete_knowledge_item failed: %s", e)
         return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Analytics
+
+def get_campaign_hourly_stats(campaign_id, date):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    EXTRACT(HOUR FROM created_at)::int AS hour,
+                    COUNT(*)::int AS calls
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                  AND DATE(created_at)=%s::date
+                GROUP BY 1
+                ORDER BY 1
+                """,
+                (campaign_id, date),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaign_hourly_stats failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_disposition_breakdown(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(disposition, 'unknown') AS disposition, COUNT(*)::int AS count
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                GROUP BY 1
+                ORDER BY count DESC
+                """,
+                (campaign_id,),
+            )
+            rows = _list(cur.fetchall())
+            return {r["disposition"]: r["count"] for r in rows}
+    except Exception as e:
+        logger.exception("get_disposition_breakdown failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_conversion_funnel(campaign_id):
+    empty = {
+        "total_leads": 0,
+        "dialed": 0,
+        "connected": 0,
+        "interested": 0,
+        "booked": 0,
+        "conversion_rate_pct": 0.0,
+    }
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH lead_totals AS (
+                    SELECT COUNT(*)::int AS total_leads
+                    FROM leads WHERE campaign_id=%s::uuid
+                ),
+                call_totals AS (
+                    SELECT
+                        COUNT(*)::int AS dialed,
+                        COUNT(*) FILTER (WHERE status IN ('active','completed'))::int AS connected,
+                        COUNT(*) FILTER (WHERE disposition IN ('interested','callback_requested','booked'))::int AS interested,
+                        COUNT(*) FILTER (WHERE was_booked=true)::int AS booked
+                    FROM calls WHERE campaign_id=%s::uuid
+                )
+                SELECT * FROM lead_totals CROSS JOIN call_totals
+                """,
+                (campaign_id, campaign_id),
+            )
+            row = _dict(cur.fetchone()) or {}
+            result = {**empty, **row}
+            total_leads = int(result.get("total_leads") or 0)
+            booked = int(result.get("booked") or 0)
+            result["conversion_rate_pct"] = round((booked / total_leads) * 100, 2) if total_leads else 0.0
+            return result
+    except Exception as e:
+        logger.exception("get_conversion_funnel failed: %s", e)
+        return empty
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_agent_performance(business_id, days=7):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.agent_id,
+                    COALESCE(a.name, 'Unknown') AS agent_name,
+                    COUNT(*)::int AS total_calls,
+                    COALESCE(AVG(c.duration_seconds), 0)::int AS avg_duration,
+                    COUNT(*) FILTER (WHERE c.was_booked=true)::int AS booked_count,
+                    COUNT(*) FILTER (WHERE c.sentiment='positive')::int AS positive_count,
+                    COUNT(*) FILTER (WHERE c.sentiment='neutral')::int AS neutral_count,
+                    COUNT(*) FILTER (WHERE c.sentiment='negative')::int AS negative_count
+                FROM calls c
+                LEFT JOIN agents a ON a.id = c.agent_id
+                WHERE c.business_id=%s::uuid
+                  AND c.created_at >= NOW() - (%s || ' days')::interval
+                GROUP BY c.agent_id, a.name
+                ORDER BY total_calls DESC
+                """,
+                (business_id, int(days)),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_agent_performance failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_cost_report(business_id, from_date, to_date):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.campaign_id,
+                    COALESCE(cp.name, 'Unknown') AS campaign_name,
+                    COUNT(*)::int AS total_calls,
+                    COUNT(*) FILTER (WHERE c.was_booked=true)::int AS booked_count,
+                    COALESCE(SUM(c.estimated_cost_usd), 0)::numeric(10,4) AS total_cost_usd
+                FROM calls c
+                LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+                WHERE c.business_id=%s::uuid
+                  AND DATE(c.created_at) BETWEEN %s::date AND %s::date
+                GROUP BY c.campaign_id, cp.name
+                ORDER BY total_cost_usd DESC
+                """,
+                (business_id, from_date, to_date),
+            )
+            rows = _list(cur.fetchall())
+            total_cost = sum(float(r.get("total_cost_usd") or 0) for r in rows)
+            total_calls = sum(int(r.get("total_calls") or 0) for r in rows)
+            total_bookings = sum(int(r.get("booked_count") or 0) for r in rows)
+            return {
+                "total_cost_usd": round(total_cost, 4),
+                "cost_per_call": round(total_cost / total_calls, 4) if total_calls else 0.0,
+                "cost_per_booking": round(total_cost / total_bookings, 4) if total_bookings else 0.0,
+                "by_campaign": rows,
+            }
+    except Exception as e:
+        logger.exception("get_cost_report failed: %s", e)
+        return {"total_cost_usd": 0.0, "cost_per_call": 0.0, "cost_per_booking": 0.0, "by_campaign": []}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_live_monitor_snapshot(business_id=None):
+    conn = None
+    try:
+        active_calls = get_active_calls(business_id=business_id)
+        conn = get_conn()
+        with conn.cursor() as cur:
+            if business_id:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS count
+                    FROM calls
+                    WHERE business_id=%s::uuid
+                      AND created_at >= NOW() - INTERVAL '60 seconds'
+                    """,
+                    (business_id,),
+                )
+                calls_per_minute_now = int((cur.fetchone() or {}).get("count") or 0)
+
+                cur.execute(
+                    "SELECT id, status FROM campaigns WHERE business_id=%s::uuid ORDER BY created_at DESC",
+                    (business_id,),
+                )
+                campaigns = _list(cur.fetchall())
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS queue_depth
+                    FROM leads l
+                    JOIN campaigns c ON c.id = l.campaign_id
+                    WHERE c.business_id=%s::uuid
+                      AND c.status='active'
+                      AND l.status='pending'
+                    """,
+                    (business_id,),
+                )
+                queue_depth = int((cur.fetchone() or {}).get("queue_depth") or 0)
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS booked_today
+                    FROM calls
+                    WHERE business_id=%s::uuid
+                      AND was_booked=true
+                      AND DATE(created_at AT TIME ZONE 'Asia/Kolkata')=DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+                    """,
+                    (business_id,),
+                )
+                booked_today = int((cur.fetchone() or {}).get("booked_today") or 0)
+            else:
+                cur.execute("SELECT COUNT(*)::int AS count FROM calls WHERE created_at >= NOW() - INTERVAL '60 seconds'")
+                calls_per_minute_now = int((cur.fetchone() or {}).get("count") or 0)
+
+                cur.execute("SELECT id, status FROM campaigns ORDER BY created_at DESC")
+                campaigns = _list(cur.fetchall())
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS queue_depth
+                    FROM leads l
+                    JOIN campaigns c ON c.id = l.campaign_id
+                    WHERE c.status='active'
+                      AND l.status='pending'
+                    """
+                )
+                queue_depth = int((cur.fetchone() or {}).get("queue_depth") or 0)
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS booked_today
+                    FROM calls
+                    WHERE was_booked=true
+                      AND DATE(created_at AT TIME ZONE 'Asia/Kolkata')=DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+                    """
+                )
+                booked_today = int((cur.fetchone() or {}).get("booked_today") or 0)
+
+        return {
+            "active_calls": active_calls,
+            "calls_per_minute_now": calls_per_minute_now,
+            "campaign_statuses": {str(r["id"]): r["status"] for r in campaigns},
+            "queue_depth": queue_depth,
+            "booked_today": booked_today,
+        }
+    except Exception as e:
+        logger.exception("get_live_monitor_snapshot failed: %s", e)
+        return {
+            "active_calls": [],
+            "calls_per_minute_now": 0,
+            "campaign_statuses": {},
+            "queue_depth": 0,
+            "booked_today": 0,
+        }
     finally:
         if conn is not None:
             release_conn(conn)

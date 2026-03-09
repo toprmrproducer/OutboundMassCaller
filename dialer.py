@@ -35,6 +35,8 @@ async def _run_campaign(campaign_id: str):
                 break
 
             if not _in_call_window(campaign):
+                next_open = _next_window_open(campaign)
+                logging.info("[SCHEDULER] Campaign %s outside call window. Next window opens at %s.", campaign_id, next_open)
                 await asyncio.sleep(60)
                 continue
 
@@ -76,23 +78,36 @@ async def _run_campaign(campaign_id: str):
                 continue
 
             lead = leads[0]
-            db.update_lead_status(str(lead["id"]), "calling")
-            db.update_lead(
-                str(lead["id"]),
-                call_attempts=int(lead.get("call_attempts", 0)) + 1,
-                last_call_at=datetime.utcnow().isoformat(),
-            )
+            if lead.get("next_call_at"):
+                try:
+                    when = lead["next_call_at"]
+                    if isinstance(when, str):
+                        when_dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+                    else:
+                        when_dt = when
+                    if when_dt and when_dt > datetime.utcnow():
+                        continue
+                except Exception:
+                    pass
+
+            if db.is_dnc(str(campaign["business_id"]), lead["phone"]):
+                db.update_lead_status(str(lead["id"]), "dnc")
+                logging.info("[DNC] Skipping %s - on DNC list", lead["phone"])
+                continue
+
+            selected_agent_id = db.pick_variant_agent(campaign_id) or str(campaign["agent_id"])
+            logging.info("[AB] Campaign %s selected variant agent %s for lead %s", campaign_id, selected_agent_id, lead["phone"])
 
             asyncio.create_task(
                 dispatch_outbound_call(
                     phone=lead["phone"],
-                    agent_id=str(campaign["agent_id"]),
+                    agent_id=selected_agent_id,
                     sip_trunk_id=str(campaign["sip_trunk_id"]),
                     business_id=str(campaign["business_id"]),
                     campaign_id=campaign_id,
                     lead_id=str(lead["id"]),
                     script_override=None,
-                    call_attempt_number=int(lead.get("call_attempts", 0)) + 1,
+                    call_attempt_number=int(lead.get("call_attempts", 0)),
                 )
             )
 
@@ -149,6 +164,8 @@ def _in_call_window(campaign: dict) -> bool:
     tz_name = campaign.get("timezone", "Asia/Kolkata")
     tz = pytz.timezone(tz_name)
     now = datetime.now(tz)
+    if campaign.get("skip_sundays", True) and now.weekday() == 6:
+        return False
     start_str = campaign.get("call_window_start", "09:00")
     end_str = campaign.get("call_window_end", "20:00")
     sh, sm = map(int, start_str.split(":"))
@@ -156,3 +173,18 @@ def _in_call_window(campaign: dict) -> bool:
     start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
     return start <= now <= end
+
+
+def _next_window_open(campaign: dict) -> str:
+    tz_name = campaign.get("timezone", "Asia/Kolkata")
+    tz = pytz.timezone(tz_name)
+    now = datetime.now(tz)
+    start_str = campaign.get("call_window_start", "09:00")
+    sh, sm = map(int, start_str.split(":"))
+    candidate = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if now >= candidate:
+        candidate = candidate + timedelta(days=1)
+    if campaign.get("skip_sundays", True):
+        while candidate.weekday() == 6:
+            candidate = candidate + timedelta(days=1)
+    return candidate.isoformat()

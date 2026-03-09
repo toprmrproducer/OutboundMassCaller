@@ -6,12 +6,26 @@ import aiohttp
 EVOLUTION_BASE_URL = os.environ.get("EVOLUTION_API_URL", "http://localhost:8080")
 
 
-async def send_whatsapp_message(instance: str, token: str, phone: str, message: str) -> bool:
-    """Send WhatsApp message via Evolution API."""
+def build_followup_message(disposition: str, lead_name: str, booking_time: str | None = None) -> str:
+    name = (lead_name or "there").strip() or "there"
+    disp = (disposition or "").strip().lower()
+    if disp == "booked":
+        time_text = booking_time or "your scheduled time"
+        return f"Hi {name}! Your appointment is confirmed for {time_text}. Reply STOP to opt out."
+    if disp == "callback_requested":
+        return (
+            f"Hi {name}! We've noted your callback request and will call you back at your preferred time. "
+            "Reply STOP to opt out."
+        )
+    return f"Hi {name}! Thank you for your interest. Our team will follow up with you shortly. Reply STOP to opt out."
+
+
+async def send_whatsapp_message(instance_id: str, token: str, phone: str, message: str) -> bool:
+    """Send WhatsApp message via the configured HTTP API."""
     phone_clean = phone.replace("+", "").replace(" ", "")
     jid = f"{phone_clean}@s.whatsapp.net"
 
-    url = f"{EVOLUTION_BASE_URL}/message/sendText/{instance}"
+    url = f"{EVOLUTION_BASE_URL}/message/sendText/{instance_id}"
     headers = {"Content-Type": "application/json", "apikey": token}
     payload = {"number": jid, "text": message}
 
@@ -24,7 +38,7 @@ async def send_whatsapp_message(instance: str, token: str, phone: str, message: 
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status in (200, 201):
-                    logging.info(f"[WHATSAPP] Sent to {phone}: {message[:50]}")
+                    logging.info("[WHATSAPP] Sent to %s", phone)
                     return True
                 body = await resp.text()
                 logging.error(f"[WHATSAPP] Failed {resp.status}: {body}")
