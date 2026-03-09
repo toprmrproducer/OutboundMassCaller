@@ -5,473 +5,441 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime
 
-import certifi
+import pytz
 from dotenv import load_dotenv
-from livekit import api
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, llm
-from livekit.plugins import silero
 
-import db
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
 load_dotenv()
 
+import db
+from livekit import agents
+from livekit.agents import Agent, AgentSession, function_tool
+from livekit.plugins import openai as lk_openai
+from livekit.plugins import sarvam, silero
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("voice-agent")
+logger = logging.getLogger("agent")
 
 try:
-    if db.initdb():
-        logger.info("STARTUP: DB init complete")
-    else:
-        logger.warning("STARTUP: DB init failed")
-except Exception as exc:
-    logger.warning("STARTUP: DB init failed: %s", exc)
+    db.initdb()
+    logger.info("STARTUP: DB init complete")
+except Exception as e:
+    logger.warning(f"STARTUP: DB init failed: {e}")
+
+FILLERS_THINKING = ["Umm...", "Let me see...", "Acha..."]
+FILLERS_AGREEMENT = ["Haan ji,", "Bilkul,", "Theek hai,"]
+FILLERS_EMPATHY = ["Samajh sakta hoon,", "Haan, woh toh hai,"]
 
 
-FILLERS = ["Umm,", "Hmm,", "Acha,", "Dekhiye,"]
+def build_stt(cfg: dict):
+    provider = cfg.get("stt_provider", "sarvam")
+    language = cfg.get("stt_language", "hi-IN")
+    model = cfg.get("stt_model", "saaras:v3")
+    if provider == "deepgram":
+        from livekit.plugins import deepgram
+
+        return deepgram.STT(model="nova-3", language=language)
+    return sarvam.STT(language=language, model=model)
 
 
-def humanize_text(text: str) -> str:
+def build_tts(cfg: dict):
+    provider = cfg.get("tts_provider", "sarvam")
+    voice = cfg.get("tts_voice", "rohan")
+    language = cfg.get("tts_language", "hi-IN")
+    if provider == "elevenlabs":
+        from livekit.plugins import elevenlabs
+
+        return elevenlabs.TTS(voice_id=voice, model="eleven_flash_v2_5")
+    return sarvam.TTS(speaker=voice, language=language)
+
+
+def build_llm(cfg: dict):
+    temperature = cfg.get("llm_temperature", 0.7)
+    kwargs = {"model": cfg.get("llm_model") or "gpt-4.1-mini", "temperature": temperature}
+    if cfg.get("llm_base_url"):
+        kwargs["base_url"] = cfg["llm_base_url"]
+    return lk_openai.LLM(**kwargs)
+
+
+def humanize_text(text: str, user_text: str = "") -> str:
     text = (text or "").strip()
     if not text:
         return text
     if len(text.split()) > 22:
         text = text.replace(" and ", ". And ")
     text = re.sub(r"\?", "...?", text)
-    if len(text.split()) > 8 and random.random() < 0.40:
-        text = f"{random.choice(FILLERS)} {text}"
+    if random.random() < 0.30:
+        text = re.sub(r"\. ([A-Z])", r"... \1", text)
+
+    if len(text.split()) > 8:
+        if "?" in (user_text or ""):
+            filler_pool = FILLERS_THINKING
+        elif any(w in (user_text or "").lower() for w in ["busy", "baad", "time", "abhi"]):
+            filler_pool = FILLERS_EMPATHY
+        else:
+            filler_pool = FILLERS_AGREEMENT
+        if random.random() < 0.40:
+            text = f"{random.choice(filler_pool)} {text}"
     return text
 
 
-async def say_humanized(session: AgentSession, text: str, allow_interruptions: bool = True) -> None:
-    try:
-        await session.say(humanize_text(text), allow_interruptions=allow_interruptions)
-    except Exception as exc:
-        logger.exception("session.say failed: %s", exc)
-
-
-def parse_metadata(metadata: str) -> dict[str, Any]:
-    if not metadata:
-        return {}
-    try:
-        parsed = json.loads(metadata)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def parse_phone_from_context(ctx: JobContext, metadata: str) -> str:
-    phone = "unknown"
-    meta = parse_metadata(metadata)
-    phone = (meta.get("phone") or meta.get("phone_number") or "").strip() or phone
-
-    if phone == "unknown" and metadata.startswith("+"):
-        phone = metadata.strip()
-
-    for identity, participant in ctx.room.remote_participants.items():
-        attrs = participant.attributes or {}
-        p = attrs.get("sip.phoneNumber") or attrs.get("phoneNumber") or ""
-        if p:
-            phone = p
-            break
-        if "+" in identity:
-            match = re.search(r"\+\d{7,15}", identity)
-            if match:
-                phone = match.group(0)
-                break
-
-    return phone
-
-
-def build_system_prompt(agent_cfg: dict[str, Any], phone: str) -> str:
-    now_ist = datetime.now(timezone.utc).astimezone()
-    base = (agent_cfg.get("system_prompt") or "").strip()
-    instructions = (agent_cfg.get("agent_instructions") or "").strip()
-    return "\n\n".join(
-        x
-        for x in [
-            base,
-            instructions,
-            f"Caller phone: {phone}",
-            f"Current datetime: {now_ist.isoformat()}",
-            "Keep responses concise and conversational. Use tools when needed.",
-        ]
-        if x
-    )
-
-
-def build_stt(cfg: dict[str, Any]):
-    provider = (cfg.get("stt_provider") or "sarvam").lower()
-    language = cfg.get("stt_language") or "hi-IN"
-
-    if provider == "deepgram":
-        from livekit.plugins import deepgram
-
-        if not language.lower().startswith("en"):
-            language = "en"
-        return deepgram.STT(model="nova-3", language=language)
-
-    from livekit.plugins import sarvam
-
-    return sarvam.STT(language=language, model=cfg.get("stt_model", "saaras:v3"))
-
-
-def build_tts(cfg: dict[str, Any]):
-    provider = (cfg.get("tts_provider") or "sarvam").lower()
-
-    if provider == "elevenlabs":
-        from livekit.plugins import elevenlabs
-
-        return elevenlabs.TTS(voice_id=cfg.get("tts_voice"), model="eleven_flash_v2_5")
-
-    from livekit.plugins import sarvam
-
-    return sarvam.TTS(speaker=cfg.get("tts_voice", "rohan"), language=cfg.get("tts_language", "hi-IN"))
-
-
-def build_llm(cfg: dict[str, Any]):
-    from livekit.plugins import openai as lk_openai
-
-    kwargs: dict[str, Any] = {
-        "model": cfg.get("llm_model") or "gpt-4o-mini",
-        "temperature": cfg.get("llm_temperature", 0.7),
-    }
-    if cfg.get("llm_base_url"):
-        kwargs["base_url"] = cfg["llm_base_url"]
-    return lk_openai.LLM(**kwargs)
-
-
-def find_sip_identity(ctx: JobContext) -> str | None:
-    for identity, participant in ctx.room.remote_participants.items():
-        attrs = participant.attributes or {}
-        if identity.startswith("sip_") or attrs.get("sip.callID"):
-            return identity
-    return None
-
-
-async def start_recording(room_name: str) -> str | None:
-    livekit_url = os.getenv("LIVEKIT_URL", "")
-    livekit_key = os.getenv("LIVEKIT_API_KEY", "")
-    livekit_secret = os.getenv("LIVEKIT_API_SECRET", "")
-    r2_bucket = os.getenv("R2_BUCKET", "")
-    r2_endpoint = os.getenv("R2_ENDPOINT", "")
-    r2_access_key = os.getenv("R2_ACCESS_KEY", "")
-    r2_secret_key = os.getenv("R2_SECRET_KEY", "")
-
-    if not all([livekit_url, livekit_key, livekit_secret, r2_bucket, r2_endpoint, r2_access_key, r2_secret_key]):
-        logger.info("Recording skipped: missing R2 or LiveKit env vars")
-        return None
-
-    lk = api.LiveKitAPI(url=livekit_url, api_key=livekit_key, api_secret=livekit_secret)
-    try:
-        req = api.RoomCompositeEgressRequest(
-            room_name=room_name,
-            audio_only=True,
-            file_outputs=[
-                api.EncodedFileOutput(
-                    file_type=api.EncodedFileType.OGG,
-                    filepath=f"recordings/{room_name}.ogg",
-                    s3=api.S3Upload(
-                        access_key=r2_access_key,
-                        secret=r2_secret_key,
-                        bucket=r2_bucket,
-                        region=os.getenv("R2_REGION", "auto"),
-                        endpoint=r2_endpoint,
-                        force_path_style=True,
-                    ),
-                )
-            ],
-        )
-        response = await lk.egress.start_room_composite_egress(req)
-        return response.egress_id
-    except Exception as exc:
-        logger.exception("start_recording failed: %s", exc)
-        return None
-    finally:
-        await lk.aclose()
-
-
-async def stop_recording(egress_id: str | None, room_name: str) -> str:
-    if not egress_id:
-        return ""
-
-    livekit_url = os.getenv("LIVEKIT_URL", "")
-    livekit_key = os.getenv("LIVEKIT_API_KEY", "")
-    livekit_secret = os.getenv("LIVEKIT_API_SECRET", "")
-
-    if not all([livekit_url, livekit_key, livekit_secret]):
-        return ""
-
-    lk = api.LiveKitAPI(url=livekit_url, api_key=livekit_key, api_secret=livekit_secret)
-    try:
-        await lk.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id))
-    except Exception as exc:
-        logger.exception("stop_recording failed: %s", exc)
-    finally:
-        await lk.aclose()
-
-    endpoint = os.getenv("R2_PUBLIC_BASE_URL", "").strip() or os.getenv("R2_ENDPOINT", "").strip()
-    bucket = os.getenv("R2_BUCKET", "").strip()
-    if not endpoint or not bucket:
-        return ""
-    return f"{endpoint.rstrip('/')}/{bucket}/recordings/{room_name}.ogg"
-
-
 def infer_sentiment(transcript_text: str) -> str:
+    # TODO: Replace with LLM-based sentiment via post_call.py
+    # This keyword approach fails on Hindi/Hinglish.
+    # post_call.py will overwrite this with gpt-4.1-nano result.
     text = (transcript_text or "").lower()
-    if any(k in text for k in ["angry", "frustrated", "not interested", "stop calling", "bad"]):
+    negative_keywords = [
+        "angry",
+        "frustrated",
+        "not interested",
+        "stop calling",
+        "bad",
+        "nahi chahiye",
+        "mat karo",
+        "hatao",
+        "band karo",
+    ]
+    positive_keywords = [
+        "thanks",
+        "great",
+        "perfect",
+        "book",
+        "yes",
+        "haan",
+        "theek hai",
+        "bilkul",
+        "zaroor",
+        "confirm",
+        "appointment",
+    ]
+    if any(k in text for k in negative_keywords):
         return "negative"
-    if any(k in text for k in ["thanks", "great", "perfect", "book", "yes"]):
+    if any(k in text for k in positive_keywords):
         return "positive"
     return "neutral"
 
 
+async def say_humanized(session: AgentSession, text: str, user_text: str = "", allow_interruptions: bool = True):
+    await session.say(humanize_text(text, user_text), allow_interruptions=allow_interruptions)
+
+
+def build_system_prompt(agent_cfg: dict, lead: dict = None, campaign: dict = None, script_override: str = None) -> str:
+    ist = pytz.timezone("Asia/Kolkata")
+    now_str = datetime.now(ist).strftime("%I:%M %p, %A")
+
+    campaign = campaign or {}
+    lead = lead or {}
+
+    base_prompt = script_override or campaign.get("custom_script") or agent_cfg.get("system_prompt", "")
+    caller_name = lead.get("name", "the caller")
+    caller_phone = lead.get("phone", "")
+    custom_data = json.dumps(lead.get("custom_data", {}), ensure_ascii=False)
+    objective = campaign.get("objective", "have a helpful conversation")
+
+    return f"""
+{base_prompt}
+
+CURRENT CALL CONTEXT:
+- Caller name: {caller_name}
+- Caller phone: {caller_phone}
+- Campaign objective: {objective}
+- Caller data: {custom_data}
+- Current time (IST): {now_str}
+
+CONVERSATION RULES (ABSOLUTE — NEVER BREAK):
+- You are a human agent. Never say you are AI, bot, or assistant.
+- If asked "are you a bot/AI?":
+  First time: "Main? Nahi nahi, main ek real agent hoon. Waise, aapke baare mein batao..."
+  Second time: "Arre, main toh real mein baat kar raha hoon. Anyway, [pivot to objective]"
+  Third time: "[laugh] Sab yahi poochte hain. Mujhe batao, [ask genuine question about their need]"
+- Max 2 sentences per response. Hard limit: 40 words total.
+- Ask ONE question at a time. Never dump multiple questions.
+- Use natural fillers: umm, acha, theek hai, haan ji, dekhiye.
+  Maximum ONE filler per response.
+- When caller shows interest → move toward booking immediately.
+- When caller gives hard rejection → thank warmly and end call.
+- Never repeat the same sentence twice in a conversation.
+- Match the caller's language (Hindi/English/mixed).
+
+ENDING TRIGGERS:
+- Call end_call tool when: caller says goodbye, confirmed appointment,
+  confirmed not interested, or after max_turns.
+- Call book_appointment tool when: caller agrees to meet/visit.
+- Call reschedule_call tool when: caller says "call later" or "baad mein".
+- Call transfer_to_human tool when: caller insists on speaking with manager or senior.
+- Call send_whatsapp tool when: caller asks for details on WhatsApp.
+"""
+
+
+def parse_phone_from_context(ctx, metadata: str) -> str:
+    room = ctx.room.name
+    if room.startswith("_+"):
+        parts = room.split("_")
+        for part in parts:
+            if part.startswith("+"):
+                return part
+    try:
+        meta = json.loads(metadata)
+        return meta.get("phone_number", "unknown")
+    except Exception:
+        return "unknown"
+
+
 class CallTools:
-    def __init__(self, session: AgentSession | None, room, phone: str, call_id: str | None):
+    def __init__(self, session: AgentSession, ctx, phone: str, call_id: str, lead_id: str, campaign_id: str, business_id: str):
         self.session = session
-        self.room = room
+        self.ctx = ctx
         self.phone = phone
         self.call_id = call_id
-        self.ctx_api = None
-        self.sip_participant_identity: str | None = None
+        self.lead_id = lead_id
+        self.campaign_id = campaign_id
+        self.business_id = business_id
+        self._agent_id = ""
 
-    @llm.function_tool
-    async def end_call(self) -> str:
-        """End the current call gracefully."""
+    @function_tool
+    async def end_call(self, reason: str = "conversation_complete") -> str:
+        """End the current call. Use when conversation is complete, caller is not interested, or caller says goodbye."""
+        logging.info(f"[TOOL] end_call: {reason}")
+        if self.lead_id:
+            db.update_lead_status(self.lead_id, "completed")
+        db.update_call(self.ctx.room.name, disposition=reason, status="completed")
+        await asyncio.sleep(1)
+        await self.ctx.room.disconnect()
+        return "Call ended"
+
+    @function_tool
+    async def book_appointment(self, caller_name: str, caller_phone: str, date_time: str, notes: str = "") -> str:
+        """Book an appointment for the caller. date_time format: YYYY-MM-DD HH:MM"""
         try:
-            if self.session is not None:
-                await say_humanized(self.session, "Thank you for your time. Goodbye!")
-                await asyncio.sleep(0.8)
-            await self.room.disconnect()
-            return "Call ended gracefully."
-        except Exception as exc:
-            logger.exception("end_call tool failed: %s", exc)
-            return "I could not end the call right now."
-
-    @llm.function_tool
-    async def book_appointment(self, name: str, phone: str, date_time: str, notes: str = "") -> str:
-        """Book an appointment for the caller."""
-        if not self.call_id:
-            logger.error("book_appointment called without call_id")
-            return "I cannot book this right now due to missing call context."
-
-        try:
-            parsed = datetime.fromisoformat(date_time.replace("Z", "+00:00"))
-            booking = db.create_booking(
+            normalized = date_time.replace(" ", "T")
+            start_time = datetime.fromisoformat(normalized)
+            db.create_booking(
                 call_id=self.call_id,
-                caller_name=name,
-                caller_phone=phone,
+                business_id=self.business_id,
+                caller_name=caller_name,
+                caller_phone=caller_phone,
                 caller_email="",
-                start_time=parsed.isoformat(),
+                start_time=start_time.isoformat(),
                 notes=notes,
             )
-            if not booking:
-                return "I could not confirm that booking right now."
+            db.update_call(self.ctx.room.name, was_booked=True, disposition="booked")
+            if self.lead_id:
+                db.update_lead_status(self.lead_id, "completed")
+            logging.info(f"[TOOL] Booking created: {date_time}")
+            return f"Appointment booked for {date_time}"
+        except Exception as e:
+            logging.error(f"[TOOL] book_appointment error: {e}")
+            return "Booking failed, please try manually"
 
-            db.update_call(self.room.name, was_booked=True, summary=f"Booking created for {parsed.isoformat()}")
-            return f"Appointment booked for {name} at {parsed.isoformat()}."
-        except Exception as exc:
-            logger.exception("book_appointment tool failed: %s", exc)
-            return "I could not create the booking."
-
-    @llm.function_tool
-    async def transfer_call(self, transfer_to: str) -> str:
-        """Transfer the call to a human agent."""
-        if not self.ctx_api or not self.sip_participant_identity:
-            logger.error("transfer_call tool missing SIP context")
-            return "Transfer is not available for this call."
-
-        destination = transfer_to.strip()
-        if destination and not destination.startswith("sip:") and not destination.startswith("tel:"):
-            destination = f"tel:{destination}"
-
+    @function_tool
+    async def reschedule_call(self, when: str, reason: str = "") -> str:
+        """Reschedule this lead for a callback. when: ISO datetime string like 2026-03-10T15:00:00"""
         try:
-            await self.ctx_api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=self.room.name,
-                    participant_identity=self.sip_participant_identity,
-                    transfer_to=destination,
-                    play_dialtone=False,
+            if self.lead_id:
+                db.reschedule_lead(self.lead_id, when, reason=reason)
+                db.create_callback(self.lead_id, self.campaign_id, when, reason=reason)
+            db.update_call(self.ctx.room.name, disposition="callback_requested")
+            return f"Lead scheduled for callback at {when}"
+        except Exception as e:
+            logging.error(f"[TOOL] reschedule_call error: {e}")
+            return "Reschedule failed"
+
+    @function_tool
+    async def send_whatsapp(self, message: str) -> str:
+        """Send a WhatsApp message to the caller with details."""
+        try:
+            from whatsapp import send_whatsapp_message
+
+            business = db.get_business(self.business_id)
+            if business and business.get("whatsapp_instance"):
+                sent = await send_whatsapp_message(
+                    instance=business["whatsapp_instance"],
+                    token=business.get("whatsapp_token", ""),
+                    phone=self.phone,
+                    message=message,
                 )
-            )
-            return "Transfer initiated."
-        except Exception as exc:
-            logger.exception("transfer_call tool failed: %s", exc)
-            return "I could not transfer the call right now."
+                if sent:
+                    db.update_call(self.ctx.room.name, whatsapp_sent=True)
+                    return "WhatsApp message sent"
+                return "WhatsApp send failed"
+            return "WhatsApp not configured for this business"
+        except Exception as e:
+            logging.error(f"[TOOL] send_whatsapp error: {e}")
+            return "WhatsApp send failed"
+
+    @function_tool
+    async def transfer_to_human(self, reason: str = "") -> str:
+        """Transfer call to a human agent."""
+        logging.info(f"[TOOL] transfer_to_human: {reason}")
+        db.update_call(self.ctx.room.name, disposition="transfer_requested")
+        await asyncio.sleep(1)
+        await self.ctx.room.disconnect()
+        return "Transferring"
+
+    @function_tool
+    async def lookup_knowledge(self, query: str) -> str:
+        """Look up product info, pricing, FAQs, or treatment details from the knowledge base."""
+        try:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            resp = await client.embeddings.create(model="text-embedding-3-small", input=query)
+            embedding = resp.data[0].embedding
+            results = db.search_knowledge(self._agent_id, embedding, limit=2)
+            if not results:
+                return "No specific information found."
+            return "\n".join([f"{r['title']}: {r['content'][:250]}" for r in results])
+        except Exception as e:
+            logging.error(f"[TOOL] lookup_knowledge error: {e}")
+            return "Knowledge lookup failed"
 
 
-async def silence_watchdog(session: AgentSession, ctx: JobContext, activity: dict[str, float]) -> None:
-    silence_threshold = 20
-    max_nudges = 2
+async def silence_watchdog(session: AgentSession, ctx, activity_state: dict, threshold: int = 20, max_nudges: int = 2):
     nudge_count = 0
-
     while True:
         await asyncio.sleep(5)
-        if time.time() - activity["last"] <= silence_threshold:
-            continue
-
-        nudge_count += 1
-        if nudge_count > max_nudges:
-            await say_humanized(session, "It seems you're not available right now. I'll try again later. Goodbye!")
-            await asyncio.sleep(3)
-            await ctx.room.disconnect()
-            return
-
-        await say_humanized(session, "Are you still there?")
-        activity["last"] = time.time()
+        if time.time() - activity_state["last_activity"] > threshold:
+            nudge_count += 1
+            if nudge_count > max_nudges:
+                await say_humanized(session, "It seems you're not available right now. I'll try again later. Goodbye!")
+                await asyncio.sleep(3)
+                await ctx.room.disconnect()
+                return
+            await say_humanized(session, "Are you still there?")
+            activity_state["last_activity"] = time.time()
+            await asyncio.sleep(threshold)
 
 
-async def post_call_cleanup(
-    room_id: str,
-    call_id: str | None,
-    transcript_lines: list[tuple[str, str]],
-    call_started_at: datetime,
-    egress_id: str | None,
-) -> None:
+async def post_call_handler(room_id: str, call_id: str, lead_id: str, agent_cfg: dict):
     try:
-        duration = max(0, int((datetime.now(timezone.utc) - call_started_at).total_seconds()))
-        transcript_text = "\n".join(f"[{role.upper()}] {content}" for role, content in transcript_lines)
-        sentiment = infer_sentiment(transcript_text)
-        recording_url = await stop_recording(egress_id, room_id)
+        from post_call import run_post_call
 
-        summary = "Call completed"
-        if transcript_lines:
-            summary = transcript_lines[-1][1][:200]
-
-        now_ist = datetime.now()
-        update_payload: dict[str, Any] = {
-            "status": "completed",
-            "duration_seconds": duration,
-            "transcript": transcript_text,
-            "summary": summary,
-            "sentiment": sentiment,
-            "recording_url": recording_url,
-            "estimated_cost_usd": round((duration / 60.0) * 0.01, 4),
-            "call_date": now_ist.date().isoformat(),
-            "call_hour": now_ist.hour,
-        }
-        db.update_call(room_id, **update_payload)
-        db.remove_active_call(room_id)
-
-        if call_id:
-            call_row = db.get_call_by_room(room_id)
-            if call_row and call_row.get("status") == "completed" and call_row.get("lead_id"):
-                db.update_lead_status(str(call_row["lead_id"]), "completed")
-    except Exception as exc:
-        logger.exception("post_call_cleanup failed: %s", exc)
+        await run_post_call(room_id, call_id, lead_id, agent_cfg)
+    except Exception as e:
+        logging.error(f"[POST-CALL] Error: {e}")
 
 
-async def entrypoint(ctx: JobContext):
-    call_record: dict[str, Any] = {}
-    transcript_lines: list[tuple[str, str]] = []
-    egress_id: str | None = None
-
+async def entrypoint(ctx: agents.JobContext):
     try:
         await ctx.connect()
 
-        metadata = ctx.job.metadata or ""
-        meta = parse_metadata(metadata)
-        is_demo = metadata == "demo" or metadata.startswith("demo") or bool(meta.get("is_demo"))
+        metadata_raw = ctx.job.metadata or ""
+        is_demo = metadata_raw == "demo" or metadata_raw.startswith("demo")
 
-        agent_cfg = db.get_active_agent()
+        meta = {}
+        try:
+            meta = json.loads(metadata_raw)
+        except Exception:
+            meta = {}
+
+        phone = parse_phone_from_context(ctx, metadata_raw)
+        campaign_id = meta.get("campaign_id")
+        lead_id = meta.get("lead_id")
+        business_id = meta.get("business_id")
+        sip_trunk_id = meta.get("sip_trunk_id")
+        script_override = meta.get("script_override")
+        call_attempt = int(meta.get("call_attempt_number", 1) or 1)
+
+        business_id_from_meta = meta.get("business_id")
+        agent_cfg = db.get_active_agent(business_id=business_id_from_meta)
         if not agent_cfg:
-            logger.error("No active agent in DB — cannot proceed")
+            logging.error("[AGENT] No active agent found. Aborting.")
             return
 
-        stt = build_stt(agent_cfg)
-        tts = build_tts(agent_cfg)
-        llm_engine = build_llm(agent_cfg)
+        lead = db.get_lead(lead_id) if lead_id else {}
+        campaign = db.get_campaign(campaign_id) if campaign_id else {}
+
+        active_stt = build_stt(agent_cfg)
+        active_tts = build_tts(agent_cfg)
+        active_llm = build_llm(agent_cfg)
         vad = silero.VAD.load()
 
-        phone = parse_phone_from_context(ctx, metadata)
-
         call_record = db.create_call(
-            lead_id=meta.get("lead_id"),
-            campaign_id=meta.get("campaign_id"),
-            agent_id=str(agent_cfg.get("id")),
-            sip_trunk_id=meta.get("sip_trunk_id"),
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            agent_id=str(agent_cfg["id"]),
+            sip_trunk_id=sip_trunk_id,
+            business_id=business_id or str(agent_cfg.get("business_id", "")),
             phone=phone,
             room_id=ctx.room.name,
+            call_attempt_number=call_attempt,
+        )
+        call_id = str(call_record.get("id", ""))
+
+        tools_instance = CallTools(
+            session=None,
+            ctx=ctx,
+            phone=phone,
+            call_id=call_id,
+            lead_id=lead_id or "",
+            campaign_id=campaign_id or "",
+            business_id=business_id or str(agent_cfg.get("business_id", "")),
+        )
+        tools_instance._agent_id = str(agent_cfg["id"])
+
+        system_prompt = build_system_prompt(agent_cfg, lead, campaign, script_override)
+
+        voice_agent = Agent(
+            instructions=system_prompt,
+            tools=[
+                tools_instance.end_call,
+                tools_instance.book_appointment,
+                tools_instance.reschedule_call,
+                tools_instance.send_whatsapp,
+                tools_instance.transfer_to_human,
+                tools_instance.lookup_knowledge,
+            ],
         )
 
-        system_prompt = build_system_prompt(agent_cfg, phone)
+        session = AgentSession(stt=active_stt, llm=active_llm, tts=active_tts, vad=vad, turn_detection=active_stt)
+        tools_instance.session = session
 
-        call_tools = CallTools(session=None, room=ctx.room, phone=phone, call_id=call_record.get("id"))
-        call_tools.ctx_api = ctx.api
-        call_tools.sip_participant_identity = find_sip_identity(ctx)
-        toolset = llm.find_function_tools(call_tools)
-
-        voice_agent = Agent(instructions=system_prompt, tools=toolset)
-
-        session = AgentSession(
-            stt=stt,
-            llm=llm_engine,
-            tts=tts,
-            vad=vad,
-            turn_detection=stt,
-        )
-        call_tools.session = session
-
-        activity = {"last": time.time()}
-        call_started_at = datetime.now(timezone.utc)
+        activity_state = {"last_activity": time.time(), "last_user_text": ""}
+        turn_counter = {"n": 0}
 
         @session.on("user_speech_committed")
         def _on_user_speech(ev):
-            try:
-                text = (getattr(ev, "user_transcript", "") or "").strip()
-                if not text:
-                    return
-                activity["last"] = time.time()
-                transcript_lines.append(("user", text))
-                db.append_transcript_line(ctx.room.name, phone, "user", text)
-            except Exception as exc:
-                logger.exception("user transcript handler failed: %s", exc)
+            text = (getattr(ev, "user_transcript", "") or "").strip()
+            if not text:
+                return
+            turn_counter["n"] += 1
+            activity_state["last_activity"] = time.time()
+            activity_state["last_user_text"] = text
+            db.append_transcript_line(ctx.room.name, phone, "user", text, turn_counter["n"])
 
         @session.on("agent_speech_committed")
         def _on_agent_speech(ev):
-            try:
-                text = (
-                    getattr(ev, "agent_transcript", "")
-                    or getattr(ev, "transcript", "")
-                    or ""
-                ).strip()
-                if not text:
-                    return
-                activity["last"] = time.time()
-                transcript_lines.append(("assistant", text))
-                db.append_transcript_line(ctx.room.name, phone, "assistant", text)
-            except Exception as exc:
-                logger.exception("agent transcript handler failed: %s", exc)
+            text = (getattr(ev, "agent_transcript", "") or getattr(ev, "transcript", "") or "").strip()
+            if not text:
+                return
+            turn_counter["n"] += 1
+            activity_state["last_activity"] = time.time()
+            db.append_transcript_line(ctx.room.name, phone, "assistant", text, turn_counter["n"])
 
         await session.start(room=ctx.room, agent=voice_agent)
 
-        greeting = (
-            agent_cfg.get("first_line")
-            or agent_cfg.get("opening_greeting")
-            or "Hello! How can I help you today?"
-        )
-        if is_demo:
-            greeting = greeting or "Welcome to the demo. How can I help you today?"
-
-        await say_humanized(session, greeting, allow_interruptions=True)
+        greeting_text = agent_cfg.get("first_line") or "Hello! How can I help you today?"
+        if is_demo and not agent_cfg.get("first_line"):
+            greeting_text = "Hello! Welcome to the demo. How can I help you today?"
+        await say_humanized(session, greeting_text, allow_interruptions=True)
 
         asyncio.create_task(
             asyncio.to_thread(
                 db.upsert_active_call,
                 ctx.room.name,
                 phone,
-                meta.get("campaign_id"),
-                str(agent_cfg.get("id")),
+                campaign_id,
+                str(agent_cfg["id"]),
+                business_id or str(agent_cfg.get("business_id", "")),
+                sip_trunk_id,
                 "active",
-                meta.get("sip_trunk_id"),
             )
         )
 
-        egress_id = await start_recording(ctx.room.name)
-        watchdog_task = asyncio.create_task(silence_watchdog(session, ctx, activity))
+        threshold = int(agent_cfg.get("silence_threshold_seconds", 20) or 20)
+        max_nudges = int(agent_cfg.get("max_nudges", 2) or 2)
+        watchdog_task = asyncio.create_task(silence_watchdog(session, ctx, activity_state, threshold, max_nudges))
 
         await session.wait()
 
@@ -479,23 +447,17 @@ async def entrypoint(ctx: JobContext):
         try:
             await watchdog_task
         except asyncio.CancelledError:
-            pass
+            logger.debug("[WATCHDOG] Cancelled")
 
-        await post_call_cleanup(
-            room_id=ctx.room.name,
-            call_id=call_record.get("id"),
-            transcript_lines=transcript_lines,
-            call_started_at=call_started_at,
-            egress_id=egress_id,
-        )
+        asyncio.create_task(post_call_handler(ctx.room.name, call_id, lead_id or "", agent_cfg))
 
-    except Exception as exc:
-        logger.exception("entrypoint failed: %s", exc)
-        room_name = getattr(getattr(ctx, "room", None), "name", "")
-        if room_name:
-            db.update_call(room_name, status="failed", summary=str(exc))
-            db.remove_active_call(room_name)
+    except Exception as e:
+        logging.exception(f"[AGENT] Unhandled exception: {e}")
+        try:
+            await ctx.room.disconnect()
+        except Exception:
+            return
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
