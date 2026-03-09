@@ -7,15 +7,46 @@ from datetime import datetime
 
 import psycopg2
 import pytz
+import threading
+from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor, execute_values
 
 logger = logging.getLogger("db")
 
 
+_pool: pg_pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is not None:
+            return _pool
+        database_url = os.environ["DATABASE_URL"]
+        _pool = pg_pool.ThreadedConnectionPool(
+            minconn=int(os.environ.get("DB_POOL_MIN", "2")),
+            maxconn=int(os.environ.get("DB_POOL_MAX", "20")),
+            dsn=database_url,
+            cursor_factory=RealDictCursor,
+        )
+        logger.info("[DB] Connection pool initialised (min=2, max=20)")
+        return _pool
+
+
 def get_conn():
-    """Open a new PostgreSQL connection for each operation."""
-    database_url = os.environ["DATABASE_URL"]
-    return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+    """Get a connection from the pool."""
+    return _get_pool().getconn()
+
+
+def release_conn(conn):
+    """Return a connection to the pool."""
+    try:
+        _get_pool().putconn(conn)
+    except Exception as e:
+        logger.warning("[DB] release_conn failed: %s", e)
 
 
 def _dict(row):
@@ -48,8 +79,13 @@ def _update_statement(data: dict, allowed: set[str]) -> tuple[str, list]:
 
 def initdb():
     sql = """
-    CREATE EXTENSION IF NOT EXISTS pgcrypto;
-    CREATE EXTENSION IF NOT EXISTS vector;
+    -- NOTE: pgcrypto and vector extensions must be enabled
+    -- manually in Supabase Dashboard before first run.
+    -- Dashboard -> Database -> Extensions -> enable:
+    --   1. pgcrypto
+    --   2. vector (pgvector)
+    -- Do NOT attempt to create extensions from application code
+    -- as Supabase restricts this to dashboard/superuser only.
 
     CREATE TABLE IF NOT EXISTS businesses (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -249,25 +285,13 @@ def initdb():
         conn = get_conn()
         with conn, conn.cursor() as cur:
             cur.execute(sql)
-            cur.execute(
-                """
-                ALTER TABLE calls
-                ADD COLUMN IF NOT EXISTS business_id UUID
-                """
-            )
-            cur.execute(
-                """
-                ALTER TABLE active_calls
-                ADD COLUMN IF NOT EXISTS business_id UUID
-                """
-            )
         logger.info("[DB] Tables initialized")
     except Exception as e:
         logger.exception("[DB] initdb failed: %s", e)
         raise
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Businesses
@@ -291,7 +315,7 @@ def create_business(name, description=None, website=None, timezone="Asia/Kolkata
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_businesses():
@@ -306,7 +330,7 @@ def get_businesses():
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_business(id):
@@ -321,7 +345,7 @@ def get_business(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_business(id, **kwargs):
@@ -341,7 +365,7 @@ def update_business(id, **kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_business(id):
@@ -356,7 +380,7 @@ def delete_business(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # SIP Trunks
@@ -382,7 +406,7 @@ def create_sip_trunk(business_id, name, trunk_id, phone_number=None, number_pool
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_sip_trunks(business_id=None):
@@ -400,7 +424,7 @@ def get_sip_trunks(business_id=None):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_sip_trunk(id):
@@ -415,7 +439,7 @@ def get_sip_trunk(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_sip_trunk(id, **kwargs):
@@ -449,7 +473,7 @@ def update_sip_trunk(id, **kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_sip_trunk(id):
@@ -464,7 +488,7 @@ def delete_sip_trunk(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def pick_mask_number(trunk_id):
@@ -498,7 +522,7 @@ def pick_mask_number(trunk_id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Agents
@@ -579,7 +603,7 @@ def create_agent(**kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_agents(business_id=None):
@@ -597,7 +621,7 @@ def get_agents(business_id=None):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_agent(id):
@@ -612,7 +636,7 @@ def get_agent(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_active_agent(business_id: str | None = None) -> dict | None:
@@ -632,7 +656,7 @@ def get_active_agent(business_id: str | None = None) -> dict | None:
         logger.error(f"get_active_agent error: {e}")
         return None
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def update_agent(id, **kwargs):
@@ -657,7 +681,7 @@ def update_agent(id, **kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_agent(id):
@@ -672,7 +696,7 @@ def delete_agent(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def set_active_agent(id):
@@ -693,7 +717,7 @@ def set_active_agent(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Campaigns
@@ -754,7 +778,7 @@ def create_campaign(**kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_campaigns(business_id=None):
@@ -772,7 +796,7 @@ def get_campaigns(business_id=None):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_campaign(id):
@@ -787,7 +811,7 @@ def get_campaign(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_campaign(id, **kwargs):
@@ -821,7 +845,7 @@ def update_campaign(id, **kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_campaign(id):
@@ -836,7 +860,7 @@ def delete_campaign(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_campaign_stats(campaign_id):
@@ -891,7 +915,7 @@ def get_campaign_stats(campaign_id):
         return empty
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Leads
@@ -948,7 +972,7 @@ def create_lead(**kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def bulk_create_leads(campaign_id, business_id, leads):
@@ -1030,7 +1054,7 @@ def bulk_create_leads(campaign_id, business_id, leads):
         return 0
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_leads(campaign_id, status=None, limit=100, offset=0):
@@ -1064,7 +1088,7 @@ def get_leads(campaign_id, status=None, limit=100, offset=0):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_lead(id):
@@ -1079,7 +1103,7 @@ def get_lead(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_lead(id, **kwargs):
@@ -1115,7 +1139,7 @@ def update_lead(id, **kwargs):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_lead_status(id, status):
@@ -1130,35 +1154,49 @@ def update_lead_status(id, status):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_next_pending_leads(campaign_id, limit=10):
+    """
+    Fetch next pending leads and atomically mark them as 'calling'
+    to prevent double-dialing on Supabase transaction pooler.
+
+    Uses UPDATE ... RETURNING instead of FOR UPDATE SKIP LOCKED
+    because Supabase's PgBouncer transaction pooler (port 6543)
+    drops session-level locks between statements.
+    """
     conn = None
     try:
         conn = get_conn()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM leads
-                    WHERE campaign_id=%s::uuid
-                      AND status='pending'
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH candidates AS (
+                    SELECT id FROM leads
+                    WHERE campaign_id = %s::uuid
+                      AND status = 'pending'
                       AND (next_call_at IS NULL OR next_call_at <= NOW())
                     ORDER BY created_at ASC
-                    FOR UPDATE SKIP LOCKED
                     LIMIT %s
-                    """,
-                    (campaign_id, limit),
                 )
-                rows = cur.fetchall()
-                return _list(rows)
+                UPDATE leads
+                SET status = 'calling',
+                    last_call_at = NOW(),
+                    call_attempts = call_attempts + 1
+                WHERE id IN (SELECT id FROM candidates)
+                RETURNING *
+                """,
+                (campaign_id, limit),
+            )
+            rows = cur.fetchall()
+            return _list(rows)
     except Exception as e:
         logger.exception("get_next_pending_leads failed: %s", e)
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def reschedule_lead(lead_id, next_call_at, script_id=None, reason=None):
@@ -1182,7 +1220,7 @@ def reschedule_lead(lead_id, next_call_at, script_id=None, reason=None):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Call Scripts
@@ -1206,7 +1244,7 @@ def create_script(business_id, name, system_prompt, first_line):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_scripts(business_id=None):
@@ -1224,7 +1262,7 @@ def get_scripts(business_id=None):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_script(id):
@@ -1239,7 +1277,7 @@ def get_script(id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_script(id, **kwargs):
@@ -1259,7 +1297,7 @@ def update_script(id, **kwargs):
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_script(id):
@@ -1274,7 +1312,7 @@ def delete_script(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Calls
@@ -1309,7 +1347,7 @@ def create_call(lead_id, campaign_id, agent_id, sip_trunk_id, phone, room_id, bu
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_call(room_id, **kwargs):
@@ -1343,7 +1381,7 @@ def update_call(room_id, **kwargs):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_calls(campaign_id=None, business_id=None, limit=50, offset=0):
@@ -1379,7 +1417,7 @@ def get_calls(campaign_id=None, business_id=None, limit=50, offset=0):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_call_by_room(room_id):
@@ -1394,7 +1432,7 @@ def get_call_by_room(room_id):
         return None
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_call_history_for_lead(lead_id):
@@ -1409,7 +1447,7 @@ def get_call_history_for_lead(lead_id):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Transcript lines
@@ -1432,7 +1470,7 @@ def append_transcript_line(room_id, phone, role, content, turn_number):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_transcript(room_id):
@@ -1454,7 +1492,7 @@ def get_transcript(room_id):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Active calls
@@ -1488,7 +1526,7 @@ def upsert_active_call(room_id, phone, campaign_id, agent_id, business_id, sip_t
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def remove_active_call(room_id):
@@ -1503,7 +1541,7 @@ def remove_active_call(room_id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_active_calls(business_id=None):
@@ -1521,7 +1559,7 @@ def get_active_calls(business_id=None):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Bookings
@@ -1547,7 +1585,7 @@ def create_booking(call_id, business_id, caller_name, caller_phone, caller_email
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_bookings(business_id=None, limit=50):
@@ -1568,7 +1606,7 @@ def get_bookings(business_id=None, limit=50):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Scheduled callbacks
@@ -1594,7 +1632,7 @@ def create_callback(lead_id, campaign_id, scheduled_for, script_id=None, reason=
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_due_callbacks():
@@ -1617,7 +1655,7 @@ def get_due_callbacks():
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def update_callback(id, status):
@@ -1632,7 +1670,7 @@ def update_callback(id, status):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Knowledge base
@@ -1658,7 +1696,7 @@ def insert_knowledge(business_id, agent_id, category, title, content, embedding)
         return {}
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def search_knowledge(agent_id, query_embedding, limit=3):
@@ -1684,7 +1722,7 @@ def search_knowledge(agent_id, query_embedding, limit=3):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def get_knowledge_items(agent_id):
@@ -1702,7 +1740,7 @@ def get_knowledge_items(agent_id):
         return []
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 def delete_knowledge_item(id):
@@ -1717,7 +1755,7 @@ def delete_knowledge_item(id):
         return False
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 
 
 # Stats
@@ -1803,4 +1841,4 @@ def get_platform_stats(business_id=None):
         return empty
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
