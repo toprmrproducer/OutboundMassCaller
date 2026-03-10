@@ -13,6 +13,27 @@ SUMMARY_MODEL = "gpt-4.1-nano"
 SUMMARY_MAX_TOKENS = 150
 
 
+def _compute_quality_score(
+    interrupt_count: int,
+    duration_seconds: int,
+    sentiment: str,
+    was_booked: bool,
+    disposition: str,
+) -> int:
+    score = 100
+    if interrupt_count > 3:
+        score -= 5 * (interrupt_count - 3)
+    if duration_seconds < 15:
+        score -= 10
+    if (sentiment or "").lower() == "negative":
+        score -= 15
+    if was_booked:
+        score += 10
+    if (disposition or "").lower() in {"interested", "callback_requested"}:
+        score += 5
+    return max(0, min(100, int(score)))
+
+
 async def run_post_call(room_id: str, call_id: str, lead_id: str, agent_cfg: dict):
     client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -70,6 +91,15 @@ Return ONLY valid JSON. No markdown.
             except Exception as mask_err:
                 logging.warning("[POST-CALL] PII masking failed: %s", mask_err)
 
+        existing_call = db.get_call_by_room(room_id) or {}
+        quality_score = _compute_quality_score(
+            interrupt_count=int(existing_call.get("interrupt_count") or 0),
+            duration_seconds=duration,
+            sentiment=str(result.get("sentiment", "neutral") or "neutral"),
+            was_booked=bool(existing_call.get("was_booked")),
+            disposition=str(result.get("disposition", "") or ""),
+        )
+
         db.update_call(
             room_id,
             status="completed",
@@ -79,6 +109,7 @@ Return ONLY valid JSON. No markdown.
             disposition=result.get("disposition", ""),
             duration_seconds=duration,
             estimated_cost_usd=estimated_cost,
+            quality_score=quality_score,
         )
 
         disposition = (result.get("disposition", "") or "").strip().lower()

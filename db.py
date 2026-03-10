@@ -443,9 +443,26 @@ def initdb():
             )
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_direction TEXT DEFAULT 'outbound'")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS consent_disclosed BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS was_voicemail BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS amd_result TEXT")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_joined BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_mode TEXT")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS detected_language TEXT")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS quality_score INT")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS inbound_speaks_first BOOLEAN DEFAULT true")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure TEXT DEFAULT NULL")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure_language TEXT DEFAULT 'hi-IN'")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS voicemail_message TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_enabled BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_sip_address TEXT")
+            cur.execute(
+                "ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_trigger_phrases TEXT[] DEFAULT ARRAY['speak to human', 'talk to agent', 'transfer me', 'real person', 'manager', 'supervisor']::text[]"
+            )
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS dtmf_menu JSONB DEFAULT NULL")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT false")
+            cur.execute(
+                "ALTER TABLE agents ADD COLUMN IF NOT EXISTS supported_languages TEXT[] DEFAULT ARRAY['hi-IN', 'en-IN', 'ta-IN', 'te-IN', 'kn-IN', 'mr-IN']::text[]"
+            )
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS turn_count INT DEFAULT 0")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS last_user_utterance TEXT")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS live_sentiment TEXT DEFAULT 'neutral'")
@@ -728,6 +745,20 @@ def create_agent(**kwargs):
         "inbound_speaks_first": True,
         "consent_disclosure": None,
         "consent_disclosure_language": "hi-IN",
+        "voicemail_message": None,
+        "handoff_enabled": False,
+        "handoff_sip_address": None,
+        "handoff_trigger_phrases": [
+            "speak to human",
+            "talk to agent",
+            "transfer me",
+            "real person",
+            "manager",
+            "supervisor",
+        ],
+        "dtmf_menu": None,
+        "auto_detect_language": False,
+        "supported_languages": ["hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN", "mr-IN"],
         "is_active": False,
     }
     defaults.update({k: v for k, v in kwargs.items() if v is not None})
@@ -744,13 +775,16 @@ def create_agent(**kwargs):
                  tts_provider, tts_voice, tts_language,
                  system_prompt, first_line, agent_instructions,
                  max_turns, silence_threshold_seconds, max_nudges, inbound_speaks_first,
-                 consent_disclosure, consent_disclosure_language, is_active)
+                 consent_disclosure, consent_disclosure_language,
+                 voicemail_message, handoff_enabled, handoff_sip_address, handoff_trigger_phrases,
+                 dtmf_menu, auto_detect_language, supported_languages, is_active)
                 VALUES
                 (%s::uuid, %s, %s, %s, %s, %s,
                  %s, %s, %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s,
-                 %s, %s, %s, %s, %s, %s, %s)
+                 %s, %s, %s, %s, %s, %s,
+                 %s, %s, %s, %s::text[], %s::jsonb, %s, %s::text[], %s)
                 RETURNING *
                 """,
                 (
@@ -777,6 +811,13 @@ def create_agent(**kwargs):
                     defaults["inbound_speaks_first"],
                     defaults["consent_disclosure"],
                     defaults["consent_disclosure_language"],
+                    defaults["voicemail_message"],
+                    defaults["handoff_enabled"],
+                    defaults["handoff_sip_address"],
+                    list(defaults["handoff_trigger_phrases"] or []),
+                    json.dumps(defaults["dtmf_menu"]) if defaults.get("dtmf_menu") is not None else None,
+                    defaults["auto_detect_language"],
+                    list(defaults["supported_languages"] or []),
                     defaults["is_active"],
                 ),
             )
@@ -843,12 +884,16 @@ def get_active_agent(business_id: str | None = None) -> dict | None:
 
 
 def update_agent(id, **kwargs):
+    if "dtmf_menu" in kwargs and kwargs.get("dtmf_menu") is not None and not isinstance(kwargs.get("dtmf_menu"), str):
+        kwargs["dtmf_menu"] = json.dumps(kwargs.get("dtmf_menu"))
     allowed = {
         "name", "subtitle", "stt_provider", "stt_language", "stt_model",
         "llm_provider", "llm_model", "llm_base_url", "llm_temperature", "llm_max_tokens",
         "tts_provider", "tts_voice", "tts_language", "system_prompt", "first_line",
         "agent_instructions", "max_turns", "silence_threshold_seconds", "max_nudges", "is_active",
         "inbound_speaks_first", "consent_disclosure", "consent_disclosure_language",
+        "voicemail_message", "handoff_enabled", "handoff_sip_address", "handoff_trigger_phrases",
+        "dtmf_menu", "auto_detect_language", "supported_languages",
     }
     set_sql, vals = _update_statement(kwargs, allowed)
     if not set_sql:
@@ -1851,6 +1896,8 @@ def update_call(room_id, **kwargs):
         "status", "duration_seconds", "transcript", "summary", "sentiment", "disposition",
         "recording_url", "was_booked", "interrupt_count", "estimated_cost_usd", "whatsapp_sent",
         "call_date", "call_hour", "call_direction", "consent_disclosed",
+        "was_voicemail", "amd_result", "supervisor_joined", "supervisor_mode",
+        "detected_language", "quality_score",
         "lead_id", "campaign_id", "agent_id", "sip_trunk_id", "business_id",
     }
     update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
@@ -4110,6 +4157,99 @@ def get_data_retention_report(business_id):
             return default
     except Exception as e:
         logger.exception("get_data_retention_report failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_voicemail_stats(campaign_id):
+    default = {"total_voicemails": 0, "voicemail_rate_pct": 0.0}
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*)::int AS total_calls,
+                  COUNT(*) FILTER (WHERE was_voicemail=true)::int AS total_voicemails
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                """,
+                (campaign_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            total_calls = int(row.get("total_calls") or 0)
+            total_voicemails = int(row.get("total_voicemails") or 0)
+            rate = round((total_voicemails / total_calls) * 100, 2) if total_calls else 0.0
+            return {"total_voicemails": total_voicemails, "voicemail_rate_pct": rate}
+    except Exception as e:
+        logger.exception("get_voicemail_stats failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_transfer_stats(campaign_id):
+    default = {"total_transfers": 0, "transfer_rate_pct": 0.0}
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*)::int AS total_calls,
+                  COUNT(*) FILTER (
+                    WHERE disposition='transferred' OR status='transferred'
+                  )::int AS total_transfers
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                """,
+                (campaign_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            total_calls = int(row.get("total_calls") or 0)
+            total_transfers = int(row.get("total_transfers") or 0)
+            rate = round((total_transfers / total_calls) * 100, 2) if total_calls else 0.0
+            return {"total_transfers": total_transfers, "transfer_rate_pct": rate}
+    except Exception as e:
+        logger.exception("get_transfer_stats failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_quality_distribution(campaign_id):
+    default = {"excellent": 0, "good": 0, "fair": 0, "poor": 0}
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE quality_score BETWEEN 80 AND 100)::int AS excellent,
+                  COUNT(*) FILTER (WHERE quality_score BETWEEN 60 AND 79)::int AS good,
+                  COUNT(*) FILTER (WHERE quality_score BETWEEN 40 AND 59)::int AS fair,
+                  COUNT(*) FILTER (WHERE quality_score BETWEEN 0 AND 39)::int AS poor
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                """,
+                (campaign_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            return {
+                "excellent": int(row.get("excellent") or 0),
+                "good": int(row.get("good") or 0),
+                "fair": int(row.get("fair") or 0),
+                "poor": int(row.get("poor") or 0),
+            }
+    except Exception as e:
+        logger.exception("get_quality_distribution failed: %s", e)
         return default
     finally:
         if conn is not None:

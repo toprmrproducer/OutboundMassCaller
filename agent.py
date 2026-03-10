@@ -89,6 +89,63 @@ def humanize_text(text: str, user_text: str = "") -> str:
     return text
 
 
+def detect_answering_machine(audio_buffer_seconds: float, speech_started_at: float) -> str:
+    """
+    Heuristic AMD: if no speech detected within 3 seconds of connect,
+    or initial speech is very long, classify as machine.
+    """
+    try:
+        if float(audio_buffer_seconds or 0.0) > 5.0:
+            return "machine"
+        if float(speech_started_at or 0.0) > 3.0:
+            return "machine"
+        return "human"
+    except Exception:
+        return "unknown"
+
+
+def detect_language_from_text(text: str) -> str:
+    sample = (text or "").strip()
+    if not sample:
+        return ""
+    # Lightweight heuristic to avoid external latency/cost.
+    if re.search(r"[\u0900-\u097F]", sample):
+        return "hi-IN"
+    lowered = sample.lower()
+    hindi_roman = ["haan", "nahi", "achha", "theek", "aap", "kyu", "kaise", "baad", "zaroor"]
+    if any(token in lowered for token in hindi_roman):
+        return "hi-IN"
+    return "en-IN"
+
+
+async def initiate_warm_transfer(room_name: str, sip_trunk_id: str, sip_address: str) -> bool:
+    try:
+        from livekit import api as lk_api
+
+        lk = lk_api.LiveKitAPI(
+            url=os.environ["LIVEKIT_URL"],
+            api_key=os.environ["LIVEKIT_API_KEY"],
+            api_secret=os.environ["LIVEKIT_API_SECRET"],
+        )
+        try:
+            await lk.sip.create_sip_participant(
+                lk_api.CreateSIPParticipantRequest(
+                    room_name=room_name,
+                    sip_trunk_id=sip_trunk_id,
+                    sip_call_to=sip_address,
+                    participant_identity=f"transfer_{int(time.time())}",
+                    participant_name="Human Agent",
+                    wait_until_answered=False,
+                )
+            )
+            return True
+        finally:
+            await lk.aclose()
+    except Exception as e:
+        logger.warning("[HANDOFF] transfer API failed: %s", e)
+        return False
+
+
 def infer_sentiment(transcript_text: str) -> str:
     # TODO: Replace with LLM-based sentiment via post_call.py
     # This keyword approach fails on Hindi/Hinglish.
@@ -293,7 +350,9 @@ class CallTools:
     async def transfer_to_human(self, reason: str = "") -> str:
         """Transfer call to a human agent."""
         logging.info(f"[TOOL] transfer_to_human: {reason}")
-        db.update_call(self.ctx.room.name, disposition="transfer_requested")
+        if self.lead_id:
+            db.update_lead_status(self.lead_id, "transferred")
+        db.update_call(self.ctx.room.name, disposition="transferred", status="transferred")
         await asyncio.sleep(1)
         await self.ctx.room.disconnect()
         return "Transferring"
@@ -364,11 +423,45 @@ async def entrypoint(ctx: agents.JobContext):
         call_direction = str(meta.get("call_direction") or "outbound").lower()
         inbound_first_line = meta.get("inbound_first_line")
 
+        try:
+            amd_audio_seconds = float(meta.get("amd_audio_buffer_seconds") or meta.get("audio_buffer_seconds") or 0.0)
+        except Exception:
+            amd_audio_seconds = 0.0
+        try:
+            amd_speech_started_at = float(meta.get("amd_speech_started_at") or meta.get("speech_started_at") or 0.0)
+        except Exception:
+            amd_speech_started_at = 0.0
+        amd_result = detect_answering_machine(amd_audio_seconds, amd_speech_started_at)
+
         business_id_from_meta = meta.get("business_id")
         agent_cfg = db.get_active_agent(business_id=business_id_from_meta)
         if not agent_cfg:
             logging.error("[AGENT] No active agent found. Aborting.")
             return
+
+        handoff_enabled = bool(meta.get("handoff_enabled")) if "handoff_enabled" in meta else bool(
+            agent_cfg.get("handoff_enabled", False)
+        )
+        handoff_sip_address = str(meta.get("handoff_sip_address") or agent_cfg.get("handoff_sip_address") or "").strip()
+        handoff_phrases = agent_cfg.get("handoff_trigger_phrases") or [
+            "speak to human",
+            "talk to agent",
+            "transfer me",
+            "real person",
+            "manager",
+            "supervisor",
+        ]
+        if isinstance(handoff_phrases, str):
+            handoff_phrases = [handoff_phrases]
+        handoff_phrases = [str(x).lower() for x in handoff_phrases if str(x).strip()]
+
+        auto_detect_language = bool(agent_cfg.get("auto_detect_language", False))
+        supported_languages = agent_cfg.get("supported_languages") or ["hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN", "mr-IN"]
+        if isinstance(supported_languages, str):
+            supported_languages = [supported_languages]
+        supported_languages = [str(x) for x in supported_languages]
+        detected_language_state = {"value": ""}
+        handoff_state = {"in_progress": False}
 
         lead = db.get_lead(lead_id) if lead_id else {}
         campaign = db.get_campaign(campaign_id) if campaign_id else {}
@@ -390,6 +483,8 @@ async def entrypoint(ctx: agents.JobContext):
             call_direction=call_direction,
         )
         call_id = str(call_record.get("id", ""))
+        db.update_call(ctx.room.name, amd_result=amd_result)
+        logging.info("[AMD] %s detected as %s", phone, amd_result)
 
         tools_instance = CallTools(
             session=None,
@@ -422,6 +517,23 @@ async def entrypoint(ctx: agents.JobContext):
         activity_state = {"last_activity": time.time(), "last_user_text": ""}
         turn_counter = {"n": 0}
 
+        async def _handle_handoff(user_text: str):
+            if handoff_state["in_progress"]:
+                return
+            handoff_state["in_progress"] = True
+            await say_humanized(session, "Of course! Please hold while I transfer you.", user_text=user_text, allow_interruptions=False)
+            transferred = False
+            if sip_trunk_id and handoff_sip_address:
+                transferred = await initiate_warm_transfer(ctx.room.name, str(sip_trunk_id), handoff_sip_address)
+            if transferred:
+                if lead_id:
+                    db.update_lead_status(lead_id, "transferred")
+                db.update_call(ctx.room.name, disposition="transferred", status="transferred")
+                logging.info("[HANDOFF] %s transfer initiated to %s", phone, handoff_sip_address)
+            else:
+                logging.warning("[HANDOFF] Transfer failed for %s to %s", phone, handoff_sip_address)
+                handoff_state["in_progress"] = False
+
         @session.on("user_speech_committed")
         def _on_user_speech(ev):
             text = (getattr(ev, "user_transcript", "") or "").strip()
@@ -432,6 +544,29 @@ async def entrypoint(ctx: agents.JobContext):
             activity_state["last_user_text"] = text
             db.append_transcript_line(ctx.room.name, phone, "user", text, turn_counter["n"])
             db.update_active_call_turn(ctx.room.name, "user", text)
+            lowered = text.lower()
+
+            if auto_detect_language and not detected_language_state["value"]:
+                detected = detect_language_from_text(text)
+                if detected:
+                    detected_language_state["value"] = detected
+                    db.update_call(ctx.room.name, detected_language=detected)
+                    if lead_id:
+                        db.update_lead(lead_id, language=detected)
+                    if detected in supported_languages and detected != str(agent_cfg.get("stt_language") or ""):
+                        logging.info("[LANG] Switched to %s for %s", detected, phone)
+
+            if handoff_phrases and any(phrase in lowered for phrase in handoff_phrases):
+                if handoff_enabled and handoff_sip_address:
+                    asyncio.create_task(_handle_handoff(text))
+                else:
+                    asyncio.create_task(
+                        say_humanized(
+                            session,
+                            "I'm handling your request directly. Let me help you with that.",
+                            user_text=text,
+                        )
+                    )
 
         @session.on("agent_speech_committed")
         def _on_agent_speech(ev):
@@ -445,6 +580,26 @@ async def entrypoint(ctx: agents.JobContext):
 
         await session.start(room=ctx.room, agent=voice_agent)
 
+        voicemail_text = (agent_cfg.get("voicemail_message") or "").strip()
+        if amd_result == "machine" and voicemail_text:
+            await say_humanized(session, voicemail_text, allow_interruptions=False)
+            db.update_call(
+                ctx.room.name,
+                was_voicemail=True,
+                amd_result="machine",
+                status="completed",
+                disposition="voicemail",
+            )
+            if lead_id:
+                db.update_lead_status(lead_id, "voicemail")
+                lead_row = db.get_lead(lead_id) or {}
+                current_attempts = int(lead_row.get("call_attempts") or 0)
+                if current_attempts > 0:
+                    db.update_lead(lead_id, call_attempts=max(current_attempts - 1, 0))
+            await asyncio.sleep(1)
+            await ctx.room.disconnect()
+            return
+
         greeting_text = inbound_first_line if call_direction == "inbound" else (agent_cfg.get("first_line") or "Hello! How can I help you today?")
         if is_demo and not agent_cfg.get("first_line"):
             greeting_text = "Hello! Welcome to the demo. How can I help you today?"
@@ -456,6 +611,24 @@ async def entrypoint(ctx: agents.JobContext):
         inbound_speaks_first = bool(agent_cfg.get("inbound_speaks_first", True))
         if call_direction != "inbound" or inbound_speaks_first:
             await say_humanized(session, greeting_text, allow_interruptions=True)
+
+        dtmf_menu = agent_cfg.get("dtmf_menu")
+        if isinstance(dtmf_menu, str):
+            try:
+                dtmf_menu = json.loads(dtmf_menu)
+            except Exception:
+                dtmf_menu = None
+        if isinstance(dtmf_menu, dict) and dtmf_menu.get("prompt"):
+            await say_humanized(session, str(dtmf_menu.get("prompt")), allow_interruptions=False)
+            timeout_seconds = int(dtmf_menu.get("timeout_seconds") or 5)
+            await asyncio.sleep(max(1, min(timeout_seconds, 20)))
+            pressed_key = str(meta.get("dtmf_digit") or "").strip()
+            options = dtmf_menu.get("options") if isinstance(dtmf_menu.get("options"), dict) else {}
+            if pressed_key and pressed_key in options:
+                logging.info("[DTMF] %s pressed %s", phone, pressed_key)
+                script = db.get_script(str(options.get(pressed_key)))
+                if script:
+                    await say_humanized(session, script.get("first_line") or "Thank you, connecting you now.")
 
         asyncio.create_task(
             asyncio.to_thread(

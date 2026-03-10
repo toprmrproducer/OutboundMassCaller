@@ -316,6 +316,13 @@ class AgentCreate(BaseModel):
     inbound_speaks_first: bool = True
     consent_disclosure: Optional[str] = None
     consent_disclosure_language: str = "hi-IN"
+    voicemail_message: Optional[str] = None
+    handoff_enabled: bool = False
+    handoff_sip_address: Optional[str] = None
+    handoff_trigger_phrases: Optional[List[str]] = None
+    dtmf_menu: Optional[dict] = None
+    auto_detect_language: bool = False
+    supported_languages: Optional[List[str]] = None
 
 
 class AgentUpdate(BaseModel):
@@ -338,6 +345,13 @@ class AgentUpdate(BaseModel):
     inbound_speaks_first: Optional[bool] = None
     consent_disclosure: Optional[str] = None
     consent_disclosure_language: Optional[str] = None
+    voicemail_message: Optional[str] = None
+    handoff_enabled: Optional[bool] = None
+    handoff_sip_address: Optional[str] = None
+    handoff_trigger_phrases: Optional[List[str]] = None
+    dtmf_menu: Optional[dict] = None
+    auto_detect_language: Optional[bool] = None
+    supported_languages: Optional[List[str]] = None
 
 
 class CampaignCreate(BaseModel):
@@ -507,6 +521,18 @@ class BookingPatchBody(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
     start_time: Optional[str] = None
+
+
+class SupervisorJoinBody(BaseModel):
+    business_id: str
+    room_id: str
+    mode: str = "listen"
+    supervisor_id: str
+
+
+class TransferCallBody(BaseModel):
+    business_id: str
+    sip_address: str
 
 
 class AuthRegisterBody(BaseModel):
@@ -1246,6 +1272,30 @@ def get_campaign_stats(id: str):
     return db.get_campaign_stats(id)
 
 
+@app.get("/api/campaigns/{id}/voicemail-stats")
+def campaign_voicemail_stats(id: str, business_id: str = Query(...)):
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_voicemail_stats(id))
+
+
+@app.get("/api/campaigns/{id}/transfer-stats")
+def campaign_transfer_stats(id: str, business_id: str = Query(...)):
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_transfer_stats(id))
+
+
+@app.get("/api/campaigns/{id}/quality-distribution")
+def campaign_quality_distribution(id: str, business_id: str = Query(...)):
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_quality_distribution(id))
+
+
 @app.put("/api/campaigns/{id}")
 def update_campaign(id: str, body: CampaignUpdate, request: Request):
     row = db.update_campaign(id, **body.model_dump(exclude_none=True))
@@ -1614,6 +1664,98 @@ def get_call(
 @app.get("/api/leads/{id}/calls")
 def get_lead_calls(id: str):
     return db.get_call_history_for_lead(id)
+
+
+# Group A: Supervisor listen/whisper/barge
+
+@app.post("/api/supervisor/join")
+async def supervisor_join(body: SupervisorJoinBody):
+    from supervisor import supervisor_join_room
+
+    logging.info("[SUPERVISOR] join room_id=%s mode=%s business_id=%s", body.room_id, body.mode, body.business_id)
+    call_row = db.get_call_by_room(body.room_id)
+    if not call_row or str(call_row.get("business_id")) != str(body.business_id):
+        return _error("Call not found", 404)
+    payload = await supervisor_join_room(body.room_id, body.mode, body.supervisor_id)
+    if not payload:
+        return _error("Failed to create supervisor join token", 400)
+    db.update_call(body.room_id, supervisor_joined=True, supervisor_mode=payload.get("mode"))
+    return _success(
+        {
+            "livekit_url": payload.get("room_url"),
+            "token": payload.get("token"),
+            "room_id": payload.get("room_id"),
+            "mode": payload.get("mode"),
+        }
+    )
+
+
+@app.get("/api/supervisor/active-rooms")
+async def supervisor_active_rooms(business_id: str = Query(...)):
+    logging.info("[SUPERVISOR] active rooms business_id=%s", business_id)
+    active = db.get_active_calls(business_id=business_id)
+    participants_by_room = {}
+    lk = _lk_client()
+    try:
+        rooms = await lk.room.list_rooms(lk_api.ListRoomsRequest())
+        for room in getattr(rooms, "rooms", []) or []:
+            participants_by_room[getattr(room, "name", "")] = int(getattr(room, "num_participants", 0) or 0)
+    except Exception as e:
+        logging.warning("[SUPERVISOR] list_rooms failed: %s", e)
+    finally:
+        await lk.aclose()
+
+    output = []
+    for row in active:
+        room_name = str(row.get("room_id") or "")
+        item = dict(row)
+        item["participant_count"] = participants_by_room.get(room_name, 0)
+        output.append(item)
+    return _success(output)
+
+
+@app.post("/api/calls/{room_id}/transfer")
+async def manual_transfer(room_id: str, body: TransferCallBody):
+    logging.info(
+        "[HANDOFF] manual transfer room_id=%s sip_address=%s business_id=%s",
+        room_id,
+        body.sip_address,
+        body.business_id,
+    )
+    call_row = db.get_call_by_room(room_id)
+    if not call_row:
+        return _error("Call not found", 404)
+    if str(call_row.get("business_id")) != str(body.business_id):
+        return _error("Call not found", 404)
+    sip_trunk_id = call_row.get("sip_trunk_id")
+    if not sip_trunk_id:
+        return _error("Call is missing sip_trunk_id", 400)
+    trunk = db.get_sip_trunk(str(sip_trunk_id))
+    if not trunk:
+        return _error("SIP trunk not found", 404)
+
+    lk = _lk_client()
+    try:
+        await lk.sip.create_sip_participant(
+            lk_api.CreateSIPParticipantRequest(
+                room_name=room_id,
+                sip_trunk_id=trunk["trunk_id"],
+                sip_call_to=body.sip_address,
+                participant_identity=f"transfer_{uuid.uuid4().hex[:8]}",
+                participant_name="Human Agent",
+                wait_until_answered=False,
+            )
+        )
+    except Exception as e:
+        logging.error("[HANDOFF] manual transfer failed: %s", e)
+        return _error("Transfer failed", 500)
+    finally:
+        await lk.aclose()
+
+    db.update_call(room_id, disposition="transferred", status="transferred")
+    if call_row.get("lead_id"):
+        db.update_lead_status(str(call_row["lead_id"]), "transferred")
+    return _success({"transferred": True})
 
 
 # Trigger calls
