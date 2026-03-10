@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import random
+import hashlib
+import secrets
 import uuid
 from datetime import datetime, timedelta
 
@@ -351,6 +353,53 @@ def initdb():
     );
     CREATE INDEX IF NOT EXISTS idx_survey_responses_phone
       ON survey_responses(phone, status);
+
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      email TEXT NOT NULL UNIQUE,
+      hashed_password TEXT NOT NULL,
+      role TEXT DEFAULT 'viewer',
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      token TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      key_hash TEXT NOT NULL,
+      key_prefix TEXT NOT NULL,
+      scopes TEXT[] DEFAULT ARRAY['read', 'write']::text[],
+      last_used_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ DEFAULT NULL,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID,
+      user_id UUID,
+      action TEXT NOT NULL,
+      resource_type TEXT NOT NULL,
+      resource_id TEXT,
+      old_value JSONB,
+      new_value JSONB,
+      ip_address TEXT,
+      user_agent TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_business_created
+      ON audit_log(business_id, created_at DESC);
     """
 
     conn = None
@@ -393,7 +442,10 @@ def initdb():
                 "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_fallback_message TEXT DEFAULT 'Thank you for calling. Our team will get back to you shortly.'"
             )
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_direction TEXT DEFAULT 'outbound'")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS consent_disclosed BOOLEAN DEFAULT false")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS inbound_speaks_first BOOLEAN DEFAULT true")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure TEXT DEFAULT NULL")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure_language TEXT DEFAULT 'hi-IN'")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS turn_count INT DEFAULT 0")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS last_user_utterance TEXT")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS live_sentiment TEXT DEFAULT 'neutral'")
@@ -674,6 +726,8 @@ def create_agent(**kwargs):
         "silence_threshold_seconds": 20,
         "max_nudges": 2,
         "inbound_speaks_first": True,
+        "consent_disclosure": None,
+        "consent_disclosure_language": "hi-IN",
         "is_active": False,
     }
     defaults.update({k: v for k, v in kwargs.items() if v is not None})
@@ -689,13 +743,14 @@ def create_agent(**kwargs):
                  llm_provider, llm_model, llm_base_url, llm_temperature, llm_max_tokens,
                  tts_provider, tts_voice, tts_language,
                  system_prompt, first_line, agent_instructions,
-                 max_turns, silence_threshold_seconds, max_nudges, inbound_speaks_first, is_active)
+                 max_turns, silence_threshold_seconds, max_nudges, inbound_speaks_first,
+                 consent_disclosure, consent_disclosure_language, is_active)
                 VALUES
                 (%s::uuid, %s, %s, %s, %s, %s,
                  %s, %s, %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s,
-                 %s, %s, %s, %s, %s)
+                 %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
@@ -720,6 +775,8 @@ def create_agent(**kwargs):
                     defaults["silence_threshold_seconds"],
                     defaults["max_nudges"],
                     defaults["inbound_speaks_first"],
+                    defaults["consent_disclosure"],
+                    defaults["consent_disclosure_language"],
                     defaults["is_active"],
                 ),
             )
@@ -791,7 +848,7 @@ def update_agent(id, **kwargs):
         "llm_provider", "llm_model", "llm_base_url", "llm_temperature", "llm_max_tokens",
         "tts_provider", "tts_voice", "tts_language", "system_prompt", "first_line",
         "agent_instructions", "max_turns", "silence_threshold_seconds", "max_nudges", "is_active",
-        "inbound_speaks_first",
+        "inbound_speaks_first", "consent_disclosure", "consent_disclosure_language",
     }
     set_sql, vals = _update_statement(kwargs, allowed)
     if not set_sql:
@@ -1793,7 +1850,8 @@ def update_call(room_id, **kwargs):
     allowed = {
         "status", "duration_seconds", "transcript", "summary", "sentiment", "disposition",
         "recording_url", "was_booked", "interrupt_count", "estimated_cost_usd", "whatsapp_sent",
-        "call_date", "call_hour", "call_direction", "lead_id", "campaign_id", "agent_id", "sip_trunk_id", "business_id",
+        "call_date", "call_hour", "call_direction", "consent_disclosed",
+        "lead_id", "campaign_id", "agent_id", "sip_trunk_id", "business_id",
     }
     update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not update_data:
@@ -1909,6 +1967,14 @@ def get_call_history_for_lead(lead_id):
 def append_transcript_line(room_id, phone, role, content, turn_number):
     conn = None
     try:
+        safe_content = content
+        if os.environ.get("PII_MASKING_ENABLED", "false").lower() == "true":
+            try:
+                from privacy.masker import mask_pii
+
+                safe_content = mask_pii(content or "")
+            except Exception:
+                safe_content = content
         conn = get_conn()
         with conn, conn.cursor() as cur:
             cur.execute(
@@ -1916,7 +1982,7 @@ def append_transcript_line(room_id, phone, role, content, turn_number):
                 INSERT INTO call_transcript_lines (room_id, phone, role, content, turn_number)
                 VALUES (%s, %s, %s, %s, %s)
                 """,
-                (room_id, _clean_phone(phone or ""), role, content, int(turn_number or 0)),
+                (room_id, _clean_phone(phone or ""), role, safe_content, int(turn_number or 0)),
             )
             return True
     except Exception as e:
@@ -3601,6 +3667,449 @@ def get_bookings_summary(business_id):
             }
     except Exception as e:
         logger.exception("get_bookings_summary failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Group D: RBAC/Auth, API keys, Audit, GDPR
+
+def create_user(business_id, email, hashed_password, role="viewer"):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (business_id, email, hashed_password, role, is_active)
+                VALUES (%s::uuid, %s, %s, %s, true)
+                RETURNING id, business_id, email, role, is_active, created_at
+                """,
+                (business_id, email.lower().strip(), hashed_password, role),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("create_user failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_user_by_email(email):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE email=%s LIMIT 1", (email.lower().strip(),))
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("get_user_by_email failed: %s", e)
+        return None
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_user(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, business_id, email, role, is_active, created_at FROM users WHERE id=%s::uuid LIMIT 1",
+                (id,),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("get_user failed: %s", e)
+        return None
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_user_session(user_id, token, expires_at):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_sessions (user_id, token, expires_at)
+                VALUES (%s::uuid, %s, %s::timestamptz)
+                RETURNING *
+                """,
+                (user_id, token, expires_at),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("create_user_session failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_user_session(token):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.*, u.email, u.role, u.business_id, u.is_active
+                FROM user_sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token=%s
+                  AND s.expires_at > NOW()
+                LIMIT 1
+                """,
+                (token,),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("get_user_session failed: %s", e)
+        return None
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_user_session(token):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM user_sessions WHERE token=%s", (token,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_user_session failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_api_key(business_id, name, scopes):
+    conn = None
+    try:
+        raw = "rxai_" + secrets.token_urlsafe(32)
+        key_hash = hashlib.sha256(raw.encode()).hexdigest()
+        key_prefix = raw[:8]
+        scopes = scopes or ["read", "write"]
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO api_keys (business_id, name, key_hash, key_prefix, scopes)
+                VALUES (%s::uuid, %s, %s, %s, %s::text[])
+                RETURNING id, business_id, name, key_prefix, scopes, created_at
+                """,
+                (business_id, name, key_hash, key_prefix, list(scopes)),
+            )
+            row = _dict(cur.fetchone()) or {}
+            row["key"] = raw
+            return row
+    except Exception as e:
+        logger.exception("create_api_key failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def validate_api_key(raw_key):
+    conn = None
+    try:
+        key_hash = hashlib.sha256((raw_key or "").encode()).hexdigest()
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, business_id, name, key_prefix, scopes, is_active, expires_at
+                FROM api_keys
+                WHERE key_hash=%s
+                  AND is_active=true
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                LIMIT 1
+                """,
+                (key_hash,),
+            )
+            row = _dict(cur.fetchone())
+            if row:
+                cur.execute("UPDATE api_keys SET last_used_at=NOW() WHERE id=%s::uuid", (row["id"],))
+            return row
+    except Exception as e:
+        logger.exception("validate_api_key failed: %s", e)
+        return None
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def revoke_api_key(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE api_keys SET is_active=false WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("revoke_api_key failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_api_keys(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, business_id, name, key_prefix, scopes, last_used_at, expires_at, is_active, created_at
+                FROM api_keys
+                WHERE business_id=%s::uuid
+                ORDER BY created_at DESC
+                """,
+                (business_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_api_keys failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def log_audit(
+    business_id,
+    user_id,
+    action,
+    resource_type,
+    resource_id=None,
+    old_value=None,
+    new_value=None,
+    ip_address=None,
+    user_agent=None,
+):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audit_log
+                (business_id, user_id, action, resource_type, resource_id,
+                 old_value, new_value, ip_address, user_agent)
+                VALUES
+                (%s::uuid, %s::uuid, %s, %s, %s,
+                 %s::jsonb, %s::jsonb, %s, %s)
+                """,
+                (
+                    business_id,
+                    user_id,
+                    action,
+                    resource_type,
+                    resource_id,
+                    json.dumps(old_value) if old_value is not None else None,
+                    json.dumps(new_value) if new_value is not None else None,
+                    ip_address,
+                    user_agent,
+                ),
+            )
+    except Exception as e:
+        logger.warning("log_audit failed: %s", e)
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_audit_log(business_id, limit=50, offset=0):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM audit_log
+                WHERE business_id=%s::uuid
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (business_id, int(limit), int(offset)),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_audit_log failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def export_lead_data(business_id, phone):
+    conn = None
+    try:
+        clean = _clean_phone(phone)
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM leads WHERE business_id=%s::uuid AND phone=%s ORDER BY created_at DESC",
+                (business_id, clean),
+            )
+            leads = _list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT id, lead_id, campaign_id, agent_id, sip_trunk_id, business_id, phone,
+                       room_id, status, call_attempt_number, duration_seconds, summary,
+                       sentiment, disposition, recording_url, was_booked, interrupt_count,
+                       estimated_cost_usd, whatsapp_sent, call_date, call_hour, created_at
+                FROM calls
+                WHERE business_id=%s::uuid AND phone=%s
+                ORDER BY created_at DESC
+                """,
+                (business_id, clean),
+            )
+            calls = _list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT b.*
+                FROM bookings b
+                JOIN calls c ON c.id = b.call_id
+                WHERE b.business_id=%s::uuid AND c.phone=%s
+                ORDER BY b.created_at DESC
+                """,
+                (business_id, clean),
+            )
+            bookings = _list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT sc.*
+                FROM scheduled_callbacks sc
+                JOIN leads l ON l.id = sc.lead_id
+                WHERE l.business_id=%s::uuid AND l.phone=%s
+                ORDER BY sc.created_at DESC
+                """,
+                (business_id, clean),
+            )
+            callbacks = _list(cur.fetchall())
+
+            cur.execute(
+                "SELECT 1 FROM dnc_list WHERE business_id=%s::uuid AND phone=%s LIMIT 1",
+                (business_id, clean),
+            )
+            on_dnc = cur.fetchone() is not None
+
+            return {
+                "phone": clean,
+                "leads": leads,
+                "calls": calls,
+                "bookings": bookings,
+                "scheduled_callbacks": callbacks,
+                "on_dnc": on_dnc,
+            }
+    except Exception as e:
+        logger.exception("export_lead_data failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_lead_pii(business_id, phone):
+    conn = None
+    try:
+        clean = _clean_phone(phone)
+        phone_hash = hashlib.sha256(clean.encode()).hexdigest()[:8]
+        replacement_phone = f"DELETED_{phone_hash}"
+
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET phone=%s,
+                    name='[DELETED]',
+                    email='[DELETED]',
+                    custom_data='{}'::jsonb,
+                    notes=NULL
+                WHERE business_id=%s::uuid AND phone=%s
+                """,
+                (replacement_phone, business_id, clean),
+            )
+
+            cur.execute(
+                """
+                UPDATE calls
+                SET phone=%s,
+                    transcript=NULL,
+                    summary=NULL
+                WHERE business_id=%s::uuid AND phone=%s
+                """,
+                (replacement_phone, business_id, clean),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO dnc_list (business_id, phone, reason, added_by)
+                VALUES (%s::uuid, %s, 'gdpr_erasure', 'system')
+                ON CONFLICT (business_id, phone)
+                DO UPDATE SET reason='gdpr_erasure', added_by='system'
+                """,
+                (business_id, replacement_phone),
+            )
+            return True
+    except Exception as e:
+        logger.exception("delete_lead_pii failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_data_retention_report(business_id):
+    default = {
+        "older_than_90_days": {"leads": 0, "calls": 0, "bookings": 0},
+        "older_than_180_days": {"leads": 0, "calls": 0, "bookings": 0},
+        "older_than_365_days": {"leads": 0, "calls": 0, "bookings": 0},
+    }
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            for days in (90, 180, 365):
+                cur.execute(
+                    "SELECT COUNT(*)::int AS c FROM leads WHERE business_id=%s::uuid AND created_at < NOW() - (%s || ' days')::interval",
+                    (business_id, days),
+                )
+                leads_c = int((_dict(cur.fetchone()) or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT COUNT(*)::int AS c FROM calls WHERE business_id=%s::uuid AND created_at < NOW() - (%s || ' days')::interval",
+                    (business_id, days),
+                )
+                calls_c = int((_dict(cur.fetchone()) or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT COUNT(*)::int AS c FROM bookings WHERE business_id=%s::uuid AND created_at < NOW() - (%s || ' days')::interval",
+                    (business_id, days),
+                )
+                bookings_c = int((_dict(cur.fetchone()) or {}).get("c") or 0)
+                default[f"older_than_{days}_days"] = {
+                    "leads": leads_c,
+                    "calls": calls_c,
+                    "bookings": bookings_c,
+                }
+            return default
+    except Exception as e:
+        logger.exception("get_data_retention_report failed: %s", e)
         return default
     finally:
         if conn is not None:

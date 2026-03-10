@@ -448,6 +448,11 @@ async def entrypoint(ctx: agents.JobContext):
         greeting_text = inbound_first_line if call_direction == "inbound" else (agent_cfg.get("first_line") or "Hello! How can I help you today?")
         if is_demo and not agent_cfg.get("first_line"):
             greeting_text = "Hello! Welcome to the demo. How can I help you today?"
+        consent_text = (agent_cfg.get("consent_disclosure") or "").strip()
+        if consent_text:
+            await say_humanized(session, consent_text, allow_interruptions=False)
+            await asyncio.sleep(0.5)
+            db.update_call(ctx.room.name, consent_disclosed=True)
         inbound_speaks_first = bool(agent_cfg.get("inbound_speaks_first", True))
         if call_direction != "inbound" or inbound_speaks_first:
             await say_humanized(session, greeting_text, allow_interruptions=True)

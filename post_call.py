@@ -60,6 +60,16 @@ Return ONLY valid JSON. No markdown.
                 "disposition": "interested",
             }
 
+        if os.environ.get("PII_MASKING_ENABLED", "false").lower() == "true":
+            try:
+                from privacy.masker import mask_pii
+
+                transcript_text = mask_pii(transcript_text)
+                if result.get("summary"):
+                    result["summary"] = mask_pii(str(result.get("summary")))
+            except Exception as mask_err:
+                logging.warning("[POST-CALL] PII masking failed: %s", mask_err)
+
         db.update_call(
             room_id,
             status="completed",

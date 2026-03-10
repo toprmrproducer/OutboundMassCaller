@@ -7,11 +7,11 @@ import os
 import re
 import signal
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import File, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, File, FastAPI, HTTPException, Header, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from livekit import api as lk_api
@@ -23,6 +23,8 @@ load_dotenv()
 from config.validator import assert_valid_env
 from jobs.queue import job_queue
 from logging_config import configure_logging
+from middleware.rate_limiter import rate_limiter
+from auth.rbac import generate_token, get_password_hash, has_permission, verify_password
 
 configure_logging()
 assert_valid_env()
@@ -60,6 +62,115 @@ def _success(data):
 
 def _error(message: str, status_code: int = 400):
     return JSONResponse(status_code=status_code, content={"data": None, "error": message})
+
+
+def _auth_enabled() -> bool:
+    return os.environ.get("AUTH_ENABLED", "false").lower() == "true"
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    if not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    return token or None
+
+
+def _safe_json_loads(raw: bytes) -> dict:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="ignore"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _extract_request_business_id(request: Request) -> Optional[str]:
+    business_id = request.query_params.get("business_id")
+    if business_id:
+        return str(business_id)
+
+    header_business = request.headers.get("x-business-id")
+    if header_business:
+        return str(header_business)
+
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            payload = _safe_json_loads(await request.body())
+            value = payload.get("business_id")
+            if value:
+                return str(value)
+    return None
+
+
+def require_auth(permission: str):
+    async def dependency(
+        request: Request,
+        authorization: Optional[str] = Header(default=None),
+        x_api_key: Optional[str] = Header(default=None),
+    ):
+        if not _auth_enabled():
+            return {"auth_bypassed": True}
+
+        # API key-based auth path
+        if x_api_key:
+            key_row = db.validate_api_key(x_api_key)
+            if not key_row:
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            scopes = set(key_row.get("scopes") or [])
+            if permission.endswith(":read") and "read" not in scopes and "write" not in scopes:
+                raise HTTPException(status_code=403, detail="API key scope forbids read")
+            if permission.endswith(":write") and "write" not in scopes:
+                raise HTTPException(status_code=403, detail="API key scope forbids write")
+            request.state.api_key = key_row
+            return {"type": "api_key", **key_row}
+
+        token = _extract_bearer_token(authorization)
+        if not token:
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+        session = db.get_user_session(token)
+        if not session or not session.get("is_active"):
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        if not has_permission(str(session.get("role") or "viewer"), permission):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        request.state.user_session = session
+        return session
+
+    return dependency
+
+
+@app.middleware("http")
+async def rate_limit_and_auth_middleware(request: Request, call_next):
+    business_id = await _extract_request_business_id(request)
+    if business_id:
+        if not rate_limiter.is_allowed(f"biz:{business_id}", 1000, 60):
+            return _error("rate limit exceeded", 429)
+        request.state.business_id = business_id
+
+    if _auth_enabled() and request.url.path.startswith("/api/"):
+        open_paths = {
+            "/api/auth/register",
+            "/api/auth/login",
+        }
+        if request.url.path not in open_paths:
+            session = None
+            api_key = None
+            token = _extract_bearer_token(request.headers.get("authorization"))
+            if token:
+                session = db.get_user_session(token)
+            elif request.headers.get("x-api-key"):
+                api_key = db.validate_api_key(request.headers.get("x-api-key"))
+            if not session and not api_key:
+                return _error("unauthorized", 401)
+            if session and not session.get("is_active"):
+                return _error("unauthorized", 401)
+            request.state.user_session = session
+            request.state.api_key = api_key
+
+    return await call_next(request)
 
 
 def register_signal_handlers():
@@ -203,6 +314,8 @@ class AgentCreate(BaseModel):
     silence_threshold_seconds: int = 20
     max_nudges: int = 2
     inbound_speaks_first: bool = True
+    consent_disclosure: Optional[str] = None
+    consent_disclosure_language: str = "hi-IN"
 
 
 class AgentUpdate(BaseModel):
@@ -223,6 +336,8 @@ class AgentUpdate(BaseModel):
     max_turns: Optional[int] = None
     is_active: Optional[bool] = None
     inbound_speaks_first: Optional[bool] = None
+    consent_disclosure: Optional[str] = None
+    consent_disclosure_language: Optional[str] = None
 
 
 class CampaignCreate(BaseModel):
@@ -394,6 +509,30 @@ class BookingPatchBody(BaseModel):
     start_time: Optional[str] = None
 
 
+class AuthRegisterBody(BaseModel):
+    business_id: str
+    email: str
+    password: str
+    role: str = "viewer"
+
+
+class AuthLoginBody(BaseModel):
+    email: str
+    password: str
+
+
+class APIKeyCreateBody(BaseModel):
+    business_id: str
+    name: str
+    scopes: List[str] = ["read", "write"]
+
+
+class GDPRDeleteBody(BaseModel):
+    business_id: str
+    phone: str
+    requestor_name: str
+
+
 def _lk_client() -> lk_api.LiveKitAPI:
     return lk_api.LiveKitAPI(
         url=os.environ["LIVEKIT_URL"],
@@ -411,6 +550,29 @@ _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 
 def _is_valid_phone(phone: str) -> bool:
     return bool(_PHONE_RE.match(phone or ""))
+
+
+def _actor_from_request(request: Optional[Request]) -> dict:
+    if request is None:
+        return {"user_id": None, "ip": None, "ua": None}
+    session = getattr(request.state, "user_session", None)
+    return {
+        "user_id": str((session or {}).get("user_id")) if session and session.get("user_id") else None,
+        "ip": request.client.host if request.client else None,
+        "ua": request.headers.get("user-agent"),
+    }
+
+
+def _check_business_scope(request: Request, business_id: Optional[str]) -> bool:
+    if not business_id:
+        return True
+    session = getattr(request.state, "user_session", None)
+    api_key = getattr(request.state, "api_key", None)
+    if session and str(session.get("business_id") or "") != str(business_id):
+        return False
+    if api_key and str(api_key.get("business_id") or "") != str(business_id):
+        return False
+    return True
 
 
 async def dispatch_outbound_call(
@@ -603,6 +765,280 @@ async def _simulator_cleanup_loop():
         await asyncio.sleep(60)
 
 
+# Group D: Auth / API keys / GDPR / Audit
+
+@app.post("/api/auth/register")
+def auth_register(body: AuthRegisterBody, request: Request):
+    logging.info("[AUTH] register email=%s business_id=%s role=%s", body.email, body.business_id, body.role)
+    allowed_roles = {"superadmin", "admin", "manager", "viewer", "agent_supervisor"}
+    if body.role not in allowed_roles:
+        return _error("Invalid role", 400)
+    if len(body.password or "") < 8:
+        return _error("Password must be at least 8 characters", 400)
+    existing = db.get_user_by_email(body.email)
+    if existing:
+        return _error("User already exists", 409)
+
+    hashed = get_password_hash(body.password)
+    user = db.create_user(body.business_id, body.email, hashed, body.role)
+    if not user:
+        return _error("Failed to register user", 400)
+
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="user.register",
+        resource_type="user",
+        resource_id=str(user.get("id")),
+        new_value={"email": user.get("email"), "role": user.get("role")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success(user)
+
+
+@app.post("/api/auth/login")
+def auth_login(body: AuthLoginBody, request: Request):
+    logging.info("[AUTH] login email=%s", body.email)
+    user = db.get_user_by_email(body.email)
+    if not user:
+        return _error("Invalid credentials", 401)
+    try:
+        password_ok = verify_password(body.password, str(user.get("hashed_password") or ""))
+    except Exception:
+        password_ok = False
+    if not password_ok:
+        return _error("Invalid credentials", 401)
+    if not user.get("is_active", True):
+        return _error("User is inactive", 403)
+
+    token = generate_token(str(user.get("id")), expiry_hours=24)
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    session = db.create_user_session(str(user.get("id")), token, expires_at)
+    if not session:
+        return _error("Failed to create session", 500)
+
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=str(user.get("business_id")),
+        user_id=str(user.get("id")),
+        action="user.login",
+        resource_type="auth",
+        resource_id=str(user.get("id")),
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success(
+        {
+            "token": token,
+            "user": {
+                "id": str(user.get("id")),
+                "business_id": str(user.get("business_id")),
+                "email": user.get("email"),
+                "role": user.get("role"),
+                "is_active": user.get("is_active"),
+            },
+            "role": user.get("role"),
+            "expires_at": session.get("expires_at"),
+        }
+    )
+
+
+@app.post("/api/auth/logout")
+def auth_logout(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    _auth=Depends(require_auth("campaigns:read")),
+):
+    if not _auth_enabled():
+        return _success({"logged_out": False, "auth_enabled": False})
+    token = _extract_bearer_token(authorization)
+    if not token:
+        return _error("Missing bearer token", 401)
+    session = db.get_user_session(token)
+    ok = db.delete_user_session(token)
+    if session:
+        actor = _actor_from_request(request)
+        db.log_audit(
+            business_id=str(session.get("business_id")),
+            user_id=str(session.get("user_id")),
+            action="user.logout",
+            resource_type="auth",
+            resource_id=str(session.get("user_id")),
+            ip_address=actor["ip"],
+            user_agent=actor["ua"],
+        )
+    if not ok:
+        return _error("Session not found", 404)
+    return _success({"logged_out": True})
+
+
+@app.get("/api/auth/me")
+def auth_me(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    _auth=Depends(require_auth("campaigns:read")),
+):
+    if not _auth_enabled():
+        return _success({"auth_enabled": False, "user": None})
+    session = getattr(request.state, "user_session", None)
+    if not session:
+        token = _extract_bearer_token(authorization)
+        session = db.get_user_session(token) if token else None
+    if not session:
+        return _error("Unauthorized", 401)
+    return _success(
+        {
+            "user_id": str(session.get("user_id")),
+            "business_id": str(session.get("business_id")),
+            "email": session.get("email"),
+            "role": session.get("role"),
+            "expires_at": session.get("expires_at"),
+        }
+    )
+
+
+@app.get("/api/api-keys")
+def api_keys_list(
+    request: Request,
+    business_id: str = Query(...),
+    _auth=Depends(require_auth("settings:read")),
+):
+    logging.info("[API-KEYS] list business_id=%s", business_id)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    return _success(db.get_api_keys(business_id))
+
+
+@app.post("/api/api-keys")
+def api_keys_create(
+    body: APIKeyCreateBody,
+    request: Request,
+    _auth=Depends(require_auth("settings:write")),
+):
+    logging.info("[API-KEYS] create business_id=%s name=%s", body.business_id, body.name)
+    if not _check_business_scope(request, body.business_id):
+        return _error("Forbidden for this business", 403)
+    row = db.create_api_key(body.business_id, body.name, body.scopes)
+    if not row:
+        return _error("Failed to create API key", 400)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="api_key.create",
+        resource_type="api_key",
+        resource_id=str(row.get("id")),
+        new_value={"name": row.get("name"), "scopes": row.get("scopes"), "key_prefix": row.get("key_prefix")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success(row)
+
+
+@app.delete("/api/api-keys/{id}")
+def api_keys_revoke(
+    id: str,
+    request: Request,
+    business_id: str = Query(...),
+    _auth=Depends(require_auth("settings:write")),
+):
+    logging.info("[API-KEYS] revoke id=%s business_id=%s", id, business_id)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    scoped_keys = {str(x.get("id")) for x in db.get_api_keys(business_id)}
+    if str(id) not in scoped_keys:
+        return _error("API key not found", 404)
+    ok = db.revoke_api_key(id)
+    if not ok:
+        return _error("API key not found", 404)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=business_id,
+        user_id=actor["user_id"],
+        action="api_key.revoke",
+        resource_type="api_key",
+        resource_id=str(id),
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success({"revoked": True})
+
+
+@app.get("/api/gdpr/export")
+def gdpr_export(
+    request: Request,
+    business_id: str = Query(...),
+    phone: str = Query(...),
+    _auth=Depends(require_auth("leads:read")),
+):
+    logging.info("[GDPR] export business_id=%s phone=%s", business_id, phone)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    data = db.export_lead_data(business_id, phone)
+    if not data:
+        return _error("No data found", 404)
+    return _success(data)
+
+
+@app.post("/api/gdpr/delete")
+def gdpr_delete(
+    body: GDPRDeleteBody,
+    request: Request,
+    _auth=Depends(require_auth("settings:write")),
+):
+    logging.info(
+        "[GDPR] delete requested business_id=%s phone=%s requestor=%s",
+        body.business_id,
+        body.phone,
+        body.requestor_name,
+    )
+    if not _check_business_scope(request, body.business_id):
+        return _error("Forbidden for this business", 403)
+    ok = db.delete_lead_pii(body.business_id, body.phone)
+    if not ok:
+        return _error("Failed to delete PII", 400)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="gdpr.delete",
+        resource_type="lead",
+        resource_id=body.phone,
+        new_value={"requestor_name": body.requestor_name},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success({"deleted": True})
+
+
+@app.get("/api/gdpr/retention-report")
+def gdpr_retention_report(
+    request: Request,
+    business_id: str = Query(...),
+    _auth=Depends(require_auth("analytics:read")),
+):
+    logging.info("[GDPR] retention report business_id=%s", business_id)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    return _success(db.get_data_retention_report(business_id))
+
+
+@app.get("/api/audit-log")
+def audit_log_api(
+    request: Request,
+    business_id: str = Query(...),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    _auth=Depends(require_auth("settings:read")),
+):
+    logging.info("[AUDIT] list business_id=%s limit=%s offset=%s", business_id, limit, offset)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    return _success(db.get_audit_log(business_id, limit=limit, offset=offset))
+
+
 # Businesses
 
 @app.post("/api/businesses")
@@ -690,10 +1126,21 @@ def delete_sip_trunk(id: str):
 # Agents
 
 @app.post("/api/agents")
-def create_agent(body: AgentCreate):
+def create_agent(body: AgentCreate, request: Request):
     row = db.create_agent(**body.model_dump())
     if not row:
         raise HTTPException(status_code=400, detail="Failed to create agent")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="agent.create",
+        resource_type="agent",
+        resource_id=str(row.get("id")),
+        new_value={"name": row.get("name")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return row
 
 
@@ -711,18 +1158,41 @@ def get_agent(id: str):
 
 
 @app.put("/api/agents/{id}")
-def update_agent(id: str, body: AgentUpdate):
+def update_agent(id: str, body: AgentUpdate, request: Request):
     row = db.update_agent(id, **body.model_dump(exclude_none=True))
     if not row:
         raise HTTPException(status_code=404, detail="Agent not found or no updates")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=str(row.get("business_id")),
+        user_id=actor["user_id"],
+        action="agent.update",
+        resource_type="agent",
+        resource_id=str(id),
+        new_value=body.model_dump(exclude_none=True),
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return row
 
 
 @app.delete("/api/agents/{id}")
-def delete_agent(id: str):
+def delete_agent(id: str, request: Request):
+    current = db.get_agent(id)
     ok = db.delete_agent(id)
     if not ok:
         raise HTTPException(status_code=404, detail="Agent not found")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=str((current or {}).get("business_id")),
+        user_id=actor["user_id"],
+        action="agent.delete",
+        resource_type="agent",
+        resource_id=str(id),
+        old_value={"name": (current or {}).get("name")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return {"success": True}
 
 
@@ -737,10 +1207,21 @@ def activate_agent(id: str):
 # Campaigns
 
 @app.post("/api/campaigns")
-def create_campaign(body: CampaignCreate):
+def create_campaign(body: CampaignCreate, request: Request):
     row = db.create_campaign(**body.model_dump())
     if not row:
         raise HTTPException(status_code=400, detail="Failed to create campaign")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="campaign.create",
+        resource_type="campaign",
+        resource_id=str(row.get("id")),
+        new_value={"name": row.get("name"), "status": row.get("status")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return row
 
 
@@ -766,18 +1247,41 @@ def get_campaign_stats(id: str):
 
 
 @app.put("/api/campaigns/{id}")
-def update_campaign(id: str, body: CampaignUpdate):
+def update_campaign(id: str, body: CampaignUpdate, request: Request):
     row = db.update_campaign(id, **body.model_dump(exclude_none=True))
     if not row:
         raise HTTPException(status_code=404, detail="Campaign not found or no updates")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=str(row.get("business_id")),
+        user_id=actor["user_id"],
+        action="campaign.update",
+        resource_type="campaign",
+        resource_id=str(id),
+        new_value=body.model_dump(exclude_none=True),
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return row
 
 
 @app.delete("/api/campaigns/{id}")
-def delete_campaign(id: str):
+def delete_campaign(id: str, request: Request):
+    current = db.get_campaign(id)
     ok = db.delete_campaign(id)
     if not ok:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=str((current or {}).get("business_id")),
+        user_id=actor["user_id"],
+        action="campaign.delete",
+        resource_type="campaign",
+        resource_id=str(id),
+        old_value={"name": (current or {}).get("name")},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return {"success": True}
 
 
@@ -890,7 +1394,7 @@ async def upload_leads(id: str, file: UploadFile = File(...)):
 
 
 @app.post("/api/campaigns/{campaign_id}/leads/import")
-async def import_leads(campaign_id: str, business_id: str = Query(...), file: UploadFile = File(...)):
+async def import_leads(campaign_id: str, request: Request, business_id: str = Query(...), file: UploadFile = File(...)):
     logging.info("[LEADS] import requested campaign_id=%s business_id=%s", campaign_id, business_id)
     campaign = db.get_campaign(campaign_id)
     if not campaign:
@@ -958,6 +1462,22 @@ async def import_leads(campaign_id: str, business_id: str = Query(...), file: Up
     job_id = uuid.uuid4().hex
     _import_jobs[job_id] = {"status": "completed", "result": result, "created_at": datetime.utcnow().isoformat()}
     result["job_id"] = job_id
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=business_id,
+        user_id=actor["user_id"],
+        action="lead.import",
+        resource_type="lead",
+        resource_id=str(campaign_id),
+        new_value={
+            "imported": inserted,
+            "duplicates_skipped": duplicates_skipped,
+            "dnc_skipped": dnc_skipped,
+            "invalid_skipped": invalid_skipped,
+        },
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return _success(result)
 
 
@@ -994,18 +1514,40 @@ def reschedule_lead(body: RescheduleLeadBody):
 # DNC Registry
 
 @app.post("/api/dnc")
-def add_dnc(body: DNCAddBody):
+def add_dnc(body: DNCAddBody, request: Request):
     logging.info("[DNC] add phone=%s business_id=%s", body.phone, body.business_id)
     row = db.add_to_dnc(body.business_id, body.phone, body.reason, body.added_by)
     if not row:
         return _error("Failed to add DNC", 400)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="dnc.add",
+        resource_type="dnc",
+        resource_id=body.phone,
+        new_value={"reason": body.reason, "added_by": body.added_by},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return _success(row)
 
 
 @app.post("/api/dnc/bulk")
-def add_dnc_bulk(body: DNCBulkBody):
+def add_dnc_bulk(body: DNCBulkBody, request: Request):
     logging.info("[DNC] bulk add business_id=%s count=%s", body.business_id, len(body.phones))
     count = db.bulk_add_dnc(body.business_id, body.phones, body.reason)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="dnc.bulk_add",
+        resource_type="dnc",
+        resource_id=body.business_id,
+        new_value={"count": count},
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return _success({"added": count})
 
 
@@ -1017,11 +1559,21 @@ def list_dnc(business_id: str = Query(...), limit: int = 100, offset: int = 0):
 
 
 @app.delete("/api/dnc/{phone}")
-def remove_dnc(phone: str, business_id: str = Query(...)):
+def remove_dnc(phone: str, request: Request, business_id: str = Query(...)):
     logging.info("[DNC] remove phone=%s business_id=%s", phone, business_id)
     ok = db.remove_from_dnc(business_id, phone)
     if not ok:
         return _error("DNC entry not found", 404)
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=business_id,
+        user_id=actor["user_id"],
+        action="dnc.remove",
+        resource_type="dnc",
+        resource_id=phone,
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
     return _success({"removed": True})
 
 
