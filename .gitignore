@@ -18,3 +18,7 @@ config.json
 # IDE settings
 .vscode/
 .idea/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/

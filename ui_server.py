@@ -644,6 +644,14 @@ class TestCallBody(BaseModel):
     agent_id: str
 
 
+class SIPConfigBody(BaseModel):
+    business_id: str
+    sip_uri: str
+    username: str
+    password: str
+    caller_id: Optional[str] = None
+
+
 class CampaignSequenceCreateBody(BaseModel):
     business_id: str
     name: str
@@ -812,15 +820,26 @@ async def dispatch_outbound_call(
         trunk = db.get_sip_trunk(sip_trunk_id)
         if not trunk:
             raise RuntimeError("SIP trunk not found")
+        sip_cfg = db.get_sip_config(business_id) or {}
         mask_number = db.pick_mask_number(sip_trunk_id)
+        resolved_from_number = from_number or mask_number or sip_cfg.get("caller_id") or trunk.get("phone_number")
         room_name = f"_{phone}_{uuid.uuid4().hex[:8]}"
+
+        logging.info(
+            "[CALL] Dispatch request phone=%s trunk=%s from=%s business=%s campaign=%s",
+            phone,
+            sip_trunk_id,
+            resolved_from_number,
+            business_id,
+            campaign_id,
+        )
 
         await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name))
 
         metadata = json.dumps(
             {
                 "phone_number": phone,
-                "from_number": from_number or mask_number or trunk.get("phone_number"),
+                "from_number": resolved_from_number,
                 "agent_id": agent_id,
                 "campaign_id": campaign_id,
                 "lead_id": lead_id,
@@ -831,6 +850,22 @@ async def dispatch_outbound_call(
             }
         )
 
+        if trunk.get("trunk_id") and (sip_cfg.get("sip_uri") or sip_cfg.get("username") or sip_cfg.get("password") or resolved_from_number):
+            trunk_update_fields = {}
+            if sip_cfg.get("sip_uri"):
+                trunk_update_fields["address"] = sip_cfg.get("sip_uri")
+            if sip_cfg.get("username"):
+                trunk_update_fields["auth_username"] = sip_cfg.get("username")
+            if sip_cfg.get("password"):
+                trunk_update_fields["auth_password"] = sip_cfg.get("password")
+            if resolved_from_number:
+                trunk_update_fields["numbers"] = [resolved_from_number]
+            if trunk_update_fields:
+                try:
+                    await lk.sip.update_outbound_trunk_fields(str(trunk["trunk_id"]), **trunk_update_fields)
+                except Exception as trunk_update_error:
+                    logging.warning("[CALL] SIP trunk update skipped: %s", trunk_update_error)
+
         sip_req = lk_api.CreateSIPParticipantRequest(
             room_name=room_name,
             sip_trunk_id=trunk["trunk_id"],
@@ -839,8 +874,8 @@ async def dispatch_outbound_call(
             participant_name="Caller",
             wait_until_answered=True,
         )
-        if from_number:
-            sip_req.sip_number = from_number
+        if resolved_from_number:
+            sip_req.sip_number = resolved_from_number
 
         await lk.sip.create_sip_participant(sip_req)
 
@@ -1335,6 +1370,59 @@ def delete_business(id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Business not found")
     return {"success": True}
+
+
+@app.get("/api/config/sip")
+def get_sip_config(
+    request: Request,
+    business_id: str = Query(...),
+    _auth=Depends(require_auth("settings:read")),
+):
+    logging.info("[SIP CONFIG] Fetch business_id=%s", business_id)
+    if not _check_business_scope(request, business_id):
+        return _error("Forbidden for this business", 403)
+    return _success(db.get_sip_config(business_id))
+
+
+@app.post("/api/config/sip")
+async def save_sip_config(
+    body: SIPConfigBody,
+    request: Request,
+    _auth=Depends(require_auth("settings:write")),
+):
+    if not _check_business_scope(request, body.business_id):
+        return _error("Forbidden for this business", 403)
+
+    row = db.save_sip_config(
+        business_id=body.business_id,
+        sip_uri=body.sip_uri,
+        username=body.username,
+        password=body.password,
+        caller_id=body.caller_id,
+    )
+    if not row:
+        return _error("Failed to save SIP config", 400)
+
+    # Best effort sync to LiveKit outbound trunk if one is already configured.
+    active_trunk = next((t for t in db.get_sip_trunks(body.business_id) if t.get("is_active", True)), None)
+    if active_trunk and active_trunk.get("trunk_id"):
+        update_fields = {
+            "address": body.sip_uri,
+            "auth_username": body.username,
+            "auth_password": body.password,
+        }
+        if body.caller_id:
+            update_fields["numbers"] = [body.caller_id]
+        lk = _lk_client()
+        try:
+            await lk.sip.update_outbound_trunk_fields(str(active_trunk["trunk_id"]), **update_fields)
+            logging.info("[SIP CONFIG] LiveKit trunk updated trunk_id=%s", active_trunk["trunk_id"])
+        except Exception as e:
+            logging.warning("[SIP CONFIG] LiveKit trunk update skipped: %s", e)
+        finally:
+            await lk.aclose()
+
+    return _success(row)
 
 
 @app.get("/api/onboarding/status")

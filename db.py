@@ -75,6 +75,10 @@ def initdb():
       timezone TEXT DEFAULT 'Asia/Kolkata',
       whatsapp_instance TEXT,
       whatsapp_token TEXT,
+      sip_uri TEXT,
+      sip_username TEXT,
+      sip_password TEXT,
+      sip_caller_id TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
     );
 
@@ -553,6 +557,10 @@ def initdb():
             """,
             "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT true",
             "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_hours_before INT[] DEFAULT ARRAY[24,2]::int[]",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sip_uri TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sip_username TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sip_password TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sip_caller_id TEXT",
             "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS rotation_strategy TEXT DEFAULT 'round_robin'",
             "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS last_used_number_index INT DEFAULT 0",
             "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS calls_per_number_limit INT DEFAULT 50",
@@ -683,6 +691,59 @@ def get_business(id):
             release_conn(conn)
 
 
+def save_sip_config(business_id, sip_uri, username, password, caller_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE businesses
+                SET sip_uri=%s,
+                    sip_username=%s,
+                    sip_password=%s,
+                    sip_caller_id=%s
+                WHERE id=%s::uuid
+                RETURNING id AS business_id, sip_uri, sip_username AS username, sip_password AS password, sip_caller_id AS caller_id
+                """,
+                (sip_uri, username, password, caller_id, business_id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("save_sip_config failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_sip_config(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id AS business_id,
+                       sip_uri,
+                       sip_username AS username,
+                       sip_password AS password,
+                       sip_caller_id AS caller_id
+                FROM businesses
+                WHERE id=%s::uuid
+                LIMIT 1
+                """,
+                (business_id,),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("get_sip_config failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
 def update_business(id, **kwargs):
     allowed = {
         "name",
@@ -702,6 +763,10 @@ def update_business(id, **kwargs):
         "sms_sender_id",
         "reminder_enabled",
         "reminder_hours_before",
+        "sip_uri",
+        "sip_username",
+        "sip_password",
+        "sip_caller_id",
     }
     set_sql, vals = _update_statement(kwargs, allowed)
     if not set_sql:

@@ -3,7 +3,15 @@ import WizardStep from "../components/onboarding/WizardStep";
 
 type Business = { id?: string; name: string; timezone: string; whatsapp_instance?: string };
 
-type Trunk = { name: string; trunk_id: string; phone_number: string; number_pool: string };
+type Trunk = {
+  name: string;
+  trunk_id: string;
+  phone_number: string;
+  number_pool: string;
+  sip_uri: string;
+  sip_username: string;
+  sip_password: string;
+};
 
 type Agent = {
   name: string;
@@ -19,7 +27,15 @@ const TZS = ["Asia/Kolkata", "UTC", "America/New_York", "Europe/London"];
 export default function Onboarding() {
   const [step, setStep] = useState(1);
   const [business, setBusiness] = useState<Business>({ name: "", timezone: "Asia/Kolkata", whatsapp_instance: "" });
-  const [trunk, setTrunk] = useState<Trunk>({ name: "", trunk_id: "", phone_number: "", number_pool: "" });
+  const [trunk, setTrunk] = useState<Trunk>({
+    name: "",
+    trunk_id: "",
+    phone_number: "",
+    number_pool: "",
+    sip_uri: "",
+    sip_username: "",
+    sip_password: "",
+  });
   const [agent, setAgent] = useState<Agent>({
     name: "",
     stt_language: "hi-IN",
@@ -78,6 +94,19 @@ export default function Onboarding() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (trunk.sip_uri || trunk.sip_username || trunk.sip_password || trunk.phone_number) {
+      await fetch("/api/config/sip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          business_id: businessId,
+          sip_uri: trunk.sip_uri,
+          username: trunk.sip_username,
+          password: trunk.sip_password,
+          caller_id: trunk.phone_number,
+        }),
+      });
+    }
     setStep(4);
   };
 
@@ -149,6 +178,9 @@ export default function Onboarding() {
             <input className="w-full rounded border p-2" placeholder="Trunk Name" value={trunk.name} onChange={(e) => setTrunk((s) => ({ ...s, name: e.target.value }))} />
             <input className="w-full rounded border p-2" placeholder="Trunk ID" value={trunk.trunk_id} onChange={(e) => setTrunk((s) => ({ ...s, trunk_id: e.target.value }))} />
             <input className="w-full rounded border p-2" placeholder="Primary Phone Number" value={trunk.phone_number} onChange={(e) => setTrunk((s) => ({ ...s, phone_number: e.target.value }))} />
+            <input className="w-full rounded border p-2" placeholder="SIP Trunk URI (sip:trunk.example.com)" value={trunk.sip_uri} onChange={(e) => setTrunk((s) => ({ ...s, sip_uri: e.target.value }))} />
+            <input className="w-full rounded border p-2" placeholder="SIP Username" value={trunk.sip_username} onChange={(e) => setTrunk((s) => ({ ...s, sip_username: e.target.value }))} />
+            <input className="w-full rounded border p-2" type="password" placeholder="SIP Password" value={trunk.sip_password} onChange={(e) => setTrunk((s) => ({ ...s, sip_password: e.target.value }))} />
             <input className="w-full rounded border p-2" placeholder="Number Pool (comma separated)" value={trunk.number_pool} onChange={(e) => setTrunk((s) => ({ ...s, number_pool: e.target.value }))} />
           </WizardStep>
         ) : null}

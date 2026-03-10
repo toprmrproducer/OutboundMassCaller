@@ -4,7 +4,7 @@ import { Bar, BarChart, Funnel, FunnelChart, Line, LineChart, Pie, PieChart, Res
 type Option = { id: string; name: string };
 
 export default function Analytics() {
-  const [businessId, setBusinessId] = useState("");
+  const [businessId, setBusinessId] = useState(localStorage.getItem("business_id") || "");
   const [campaignId, setCampaignId] = useState("");
   const [fromDate, setFromDate] = useState(new Date().toISOString().slice(0, 10));
   const [toDate, setToDate] = useState(new Date().toISOString().slice(0, 10));
@@ -20,12 +20,18 @@ export default function Analytics() {
       if (!businessId) return;
       const res = await fetch(`/api/campaigns?business_id=${encodeURIComponent(businessId)}`);
       const data = await res.json();
-      const list = (data || []).map((c: any) => ({ id: String(c.id), name: c.name || String(c.id) }));
+      const list = (data?.data || data || []).map((c: any) => ({ id: String(c.id), name: c.name || String(c.id) }));
       setCampaigns(list);
       if (!campaignId && list.length > 0) setCampaignId(list[0].id);
     };
     loadCampaigns();
-  }, [businessId]);
+  }, [businessId, campaignId]);
+
+  useEffect(() => {
+    if (businessId && campaignId) {
+      load();
+    }
+  }, [businessId, campaignId]);
 
   const load = async () => {
     if (!businessId || !campaignId) return;
@@ -65,18 +71,18 @@ export default function Analytics() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 p-4 md:p-6">
+    <div className="min-h-screen bg-slate-50 p-4 dark:bg-gray-950 md:p-6">
       <div className="mx-auto max-w-7xl space-y-4">
         <h1 className="text-2xl font-semibold">Analytics</h1>
         <div className="grid gap-2 md:grid-cols-6">
-          <input className="rounded border p-2 md:col-span-2" placeholder="Business ID" value={businessId} onChange={(e) => setBusinessId(e.target.value)} />
-          <select className="rounded border p-2" value={campaignId} onChange={(e) => setCampaignId(e.target.value)}>
+          <input className="rounded border p-2 dark:border-gray-700 dark:bg-gray-900 md:col-span-2" placeholder="Business ID" value={businessId} onChange={(e) => setBusinessId(e.target.value)} />
+          <select className="rounded border p-2 dark:border-gray-700 dark:bg-gray-900" value={campaignId} onChange={(e) => setCampaignId(e.target.value)}>
             {campaigns.map((c) => (
               <option key={c.id} value={c.id}>{c.name}</option>
             ))}
           </select>
-          <input className="rounded border p-2" type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
-          <input className="rounded border p-2" type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} />
+          <input className="rounded border p-2 dark:border-gray-700 dark:bg-gray-900" type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+          <input className="rounded border p-2 dark:border-gray-700 dark:bg-gray-900" type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} />
           <button className="rounded bg-slate-900 px-3 py-2 text-white" onClick={load}>Load</button>
         </div>
 
