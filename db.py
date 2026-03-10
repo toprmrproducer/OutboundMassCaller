@@ -5910,6 +5910,8 @@ def create_notification(business_id, type, title, body, resource_type=None, reso
 
 
 def get_notifications(business_id, unread_only=False, limit=50):
+    if business_id is None or str(business_id).strip() == "":
+        return []
     conn = None
     try:
         conn = get_conn()
@@ -5961,6 +5963,8 @@ def mark_notification_read(id):
 
 
 def mark_all_read(business_id):
+    if business_id is None or str(business_id).strip() == "":
+        return None
     conn = None
     try:
         conn = get_conn()
@@ -5979,6 +5983,8 @@ def mark_all_read(business_id):
 
 
 def get_unread_count(business_id):
+    if business_id is None or str(business_id).strip() == "":
+        return 0
     conn = None
     try:
         conn = get_conn()
