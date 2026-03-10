@@ -8,12 +8,14 @@ import re
 import signal
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, File, Form, FastAPI, HTTPException, Header, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from livekit import api as lk_api
 from livekit.api import AccessToken, VideoGrants
 from pydantic import BaseModel
@@ -33,6 +35,11 @@ import db
 
 app = FastAPI(title="RapidXAI Cold Calling API", version="2.0.0")
 
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
+FRONTEND_INDEX_PATH = FRONTEND_DIST_DIR / "index.html"
+FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,6 +47,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if FRONTEND_ASSETS_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS_DIR)), name="frontend-assets")
 
 
 _live_clients: set[WebSocket] = set()
@@ -3533,6 +3543,37 @@ async def readiness_check():
             "error": None,
         },
     )
+
+
+@app.get("/", include_in_schema=False)
+async def serve_frontend_root():
+    if FRONTEND_INDEX_PATH.exists():
+        return FileResponse(FRONTEND_INDEX_PATH)
+    return _error("Frontend build not found. Build frontend before deploy.", 404)
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend_spa(full_path: str):
+    # Keep API/docs/health/webhook/ws endpoints untouched.
+    blocked_prefixes = ("api/", "docs", "redoc", "openapi.json", "health", "webhook/", "ws/")
+    if full_path == "" or full_path.startswith(blocked_prefixes):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if not FRONTEND_DIST_DIR.exists():
+        return _error("Frontend build not found. Build frontend before deploy.", 404)
+
+    candidate = (FRONTEND_DIST_DIR / full_path).resolve()
+    try:
+        candidate.relative_to(FRONTEND_DIST_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if candidate.is_file():
+        return FileResponse(candidate)
+
+    if FRONTEND_INDEX_PATH.exists():
+        return FileResponse(FRONTEND_INDEX_PATH)
+    return _error("Frontend build not found. Build frontend before deploy.", 404)
 
 
 if __name__ == "__main__":
