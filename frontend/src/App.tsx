@@ -1,10 +1,21 @@
 import { useState } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
 import GlobalSearch from "./components/GlobalSearch";
 import InstallPrompt from "./components/InstallPrompt";
 import NotificationCenter from "./components/NotificationCenter";
 import ShortcutsHelp from "./components/ShortcutsHelp";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTheme } from "./hooks/useTheme";
+import ActivityFeed from "./pages/ActivityFeed";
+import AgentSimulator from "./pages/AgentSimulator";
+import Analytics from "./pages/Analytics";
+import BookingCalendar from "./pages/BookingCalendar";
+import CampaignsPage from "./pages/Campaigns";
+import DNCRegistry from "./pages/DNCRegistry";
+import LeadsPage from "./pages/Leads";
+import LiveMonitor from "./pages/LiveMonitor";
+import NumberHealth from "./pages/NumberHealth";
+import Onboarding from "./pages/Onboarding";
 
 export default function App() {
   const businessId = localStorage.getItem("business_id") || "";
@@ -36,7 +47,21 @@ export default function App() {
       </header>
 
       <main className="p-4">
-        <p className="text-sm text-gray-600 dark:text-gray-300">Use sidebar routes to navigate pages.</p>
+        <Routes>
+          <Route path="/" element={<Navigate to="/onboarding" replace />} />
+          <Route path="/dashboard" element={<Navigate to="/live-monitor" replace />} />
+          <Route path="/onboarding" element={<Onboarding />} />
+          <Route path="/analytics" element={<Analytics />} />
+          <Route path="/live-monitor" element={<LiveMonitor />} />
+          <Route path="/activity-feed" element={<ActivityFeed />} />
+          <Route path="/dnc-registry" element={<DNCRegistry />} />
+          <Route path="/agent-simulator" element={<AgentSimulator />} />
+          <Route path="/number-health" element={<NumberHealth />} />
+          <Route path="/bookings-calendar" element={<BookingCalendar />} />
+          <Route path="/campaigns" element={<CampaignsPage />} />
+          <Route path="/leads" element={<LeadsPage />} />
+          <Route path="*" element={<Navigate to="/onboarding" replace />} />
+        </Routes>
       </main>
 
       {/* re-mount toggler for cmd/ctrl+k */}
