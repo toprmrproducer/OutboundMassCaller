@@ -514,95 +514,113 @@ def initdb():
                     "-> Database -> Extensions: %s", ext_err
                 )
 
-        with conn, conn.cursor() as cur:
-            cur.execute(_tables_sql)
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS skip_sundays BOOLEAN DEFAULT true")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS budget_cap_usd NUMERIC(10,2) DEFAULT NULL")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'not_required'")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_by TEXT")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_notes TEXT")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS pause_reason TEXT")
-            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS calls_made_before_pause INT DEFAULT 0")
-            cur.execute(
-                """
-                ALTER TABLE campaigns
-                ADD COLUMN IF NOT EXISTS retry_strategy JSONB DEFAULT
-                '{"no_answer": {"delay_minutes": 30, "max_attempts": 3}, "busy": {"delay_minutes": 15, "max_attempts": 5}, "failed": {"delay_minutes": 60, "max_attempts": 2}, "voicemail": {"delay_minutes": 240, "max_attempts": 1}, "best_time_window": {"start": "10:00", "end": "18:00"}}'::jsonb
-                """
-            )
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT true")
-            cur.execute(
-                "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_hours_before INT[] DEFAULT ARRAY[24,2]::int[]"
-            )
-            cur.execute("ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS rotation_strategy TEXT DEFAULT 'round_robin'")
-            cur.execute("ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS last_used_number_index INT DEFAULT 0")
-            cur.execute("ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS calls_per_number_limit INT DEFAULT 50")
-            cur.execute("ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_agent_id UUID")
-            cur.execute(
-                "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_fallback_message TEXT DEFAULT 'Thank you for calling. Our team will get back to you shortly.'"
-            )
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_direction TEXT DEFAULT 'outbound'")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS consent_disclosed BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS was_voicemail BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS amd_result TEXT")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_joined BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_mode TEXT")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS detected_language TEXT")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS quality_score INT")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS sms_sent BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS key_points JSONB DEFAULT '[]'::jsonb")
-            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS follow_up_action TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS inbound_speaks_first BOOLEAN DEFAULT true")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure TEXT DEFAULT NULL")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure_language TEXT DEFAULT 'hi-IN'")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS voicemail_message TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_sip_address TEXT")
-            cur.execute(
-                "ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_trigger_phrases TEXT[] DEFAULT ARRAY['speak to human', 'talk to agent', 'transfer me', 'real person', 'manager', 'supervisor']::text[]"
-            )
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS dtmf_menu JSONB DEFAULT NULL")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT false")
-            cur.execute(
-                "ALTER TABLE agents ADD COLUMN IF NOT EXISTS supported_languages TEXT[] DEFAULT ARRAY['hi-IN', 'en-IN', 'ta-IN', 'te-IN', 'kn-IN', 'mr-IN']::text[]"
-            )
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_provider TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_model TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN DEFAULT true")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_lookback_calls INT DEFAULT 3")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS persona TEXT DEFAULT 'professional'")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_followup_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_interested TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_booked TEXT")
-            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS email_followup_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score INT DEFAULT 50")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_factors JSONB DEFAULT '{}'::jsonb")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_updated_at TIMESTAMPTZ")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS temperature TEXT DEFAULT 'warm'")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT ARRAY[]::text[]")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS country_code TEXT")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS phone_e164 TEXT")
-            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT NULL")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_api_key TEXT")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_sync_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_calendar_id TEXT")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_sync_enabled BOOLEAN DEFAULT false")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_webhook_url TEXT")
-            cur.execute(
-                "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_notify_on TEXT[] DEFAULT ARRAY['booking', 'campaign_complete', 'budget_alert', 'error']::text[]"
-            )
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_provider TEXT")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_api_key TEXT")
-            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_sender_id TEXT")
-            cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gcal_event_id TEXT")
-            cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS turn_count INT DEFAULT 0")
-            cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS last_user_utterance TEXT")
-            cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS live_sentiment TEXT DEFAULT 'neutral'")
+        # Run each schema statement independently so one bad index on an old
+        # partially-migrated table cannot roll back all core table creation.
+        schema_statements = [s.strip() for s in _tables_sql.split(";") if s.strip()]
+        for stmt in schema_statements:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(stmt)
+                conn.commit()
+            except Exception as stmt_err:
+                conn.rollback()
+                stmt_upper = stmt.lstrip().upper()
+                if stmt_upper.startswith("CREATE INDEX"):
+                    logger.warning("[DB] Optional index skipped during initdb: %s", stmt_err)
+                    continue
+                logger.exception("[DB] Critical schema statement failed: %s", stmt_err)
+                raise
+
+        # Post-table migrations: run individually and continue on failures.
+        # This avoids bootstrap deadlocks on older schemas missing new columns.
+        post_migrations = [
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS next_call_at TIMESTAMPTZ DEFAULT NULL",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS scheduled_start_at TIMESTAMPTZ DEFAULT NULL",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS skip_sundays BOOLEAN DEFAULT true",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS budget_cap_usd NUMERIC(10,2) DEFAULT NULL",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT false",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'not_required'",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_by TEXT",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_notes TEXT",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS pause_reason TEXT",
+            "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS calls_made_before_pause INT DEFAULT 0",
+            """
+            ALTER TABLE campaigns
+            ADD COLUMN IF NOT EXISTS retry_strategy JSONB DEFAULT
+            '{"no_answer": {"delay_minutes": 30, "max_attempts": 3}, "busy": {"delay_minutes": 15, "max_attempts": 5}, "failed": {"delay_minutes": 60, "max_attempts": 2}, "voicemail": {"delay_minutes": 240, "max_attempts": 1}, "best_time_window": {"start": "10:00", "end": "18:00"}}'::jsonb
+            """,
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT true",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_hours_before INT[] DEFAULT ARRAY[24,2]::int[]",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS rotation_strategy TEXT DEFAULT 'round_robin'",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS last_used_number_index INT DEFAULT 0",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS calls_per_number_limit INT DEFAULT 50",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_agent_id UUID",
+            "ALTER TABLE sip_trunks ADD COLUMN IF NOT EXISTS inbound_fallback_message TEXT DEFAULT 'Thank you for calling. Our team will get back to you shortly.'",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS call_direction TEXT DEFAULT 'outbound'",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS consent_disclosed BOOLEAN DEFAULT false",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS was_voicemail BOOLEAN DEFAULT false",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS amd_result TEXT",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_joined BOOLEAN DEFAULT false",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_mode TEXT",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS detected_language TEXT",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS quality_score INT",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS sms_sent BOOLEAN DEFAULT false",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT false",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS key_points JSONB DEFAULT '[]'::jsonb",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS follow_up_action TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS inbound_speaks_first BOOLEAN DEFAULT true",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure TEXT DEFAULT NULL",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure_language TEXT DEFAULT 'hi-IN'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS voicemail_message TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_sip_address TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS handoff_trigger_phrases TEXT[] DEFAULT ARRAY['speak to human', 'talk to agent', 'transfer me', 'real person', 'manager', 'supervisor']::text[]",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS dtmf_menu JSONB DEFAULT NULL",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT false",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS supported_languages TEXT[] DEFAULT ARRAY['hi-IN', 'en-IN', 'ta-IN', 'te-IN', 'kn-IN', 'mr-IN']::text[]",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_provider TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_model TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN DEFAULT true",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_lookback_calls INT DEFAULT 3",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS persona TEXT DEFAULT 'professional'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_followup_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_interested TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_booked TEXT",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS email_followup_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS score INT DEFAULT 50",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_factors JSONB DEFAULT '{}'::jsonb",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_updated_at TIMESTAMPTZ",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS temperature TEXT DEFAULT 'warm'",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT ARRAY[]::text[]",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS country_code TEXT",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS phone_e164 TEXT",
+            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT NULL",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_api_key TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_sync_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_calendar_id TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_sync_enabled BOOLEAN DEFAULT false",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_webhook_url TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_notify_on TEXT[] DEFAULT ARRAY['booking', 'campaign_complete', 'budget_alert', 'error']::text[]",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_provider TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_api_key TEXT",
+            "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_sender_id TEXT",
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gcal_event_id TEXT",
+            "ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS turn_count INT DEFAULT 0",
+            "ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS last_user_utterance TEXT",
+            "ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS live_sentiment TEXT DEFAULT 'neutral'",
+            "CREATE INDEX IF NOT EXISTS idx_leads_next_call_at_scheduled ON leads(next_call_at) WHERE status = 'scheduled'",
+        ]
+        for stmt in post_migrations:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(stmt)
+                conn.commit()
+            except Exception as mig_err:
+                conn.rollback()
+                logger.warning("[DB] Migration skipped: %s", mig_err)
 
         logger.info("[DB] Tables initialized")
     except Exception as e:
