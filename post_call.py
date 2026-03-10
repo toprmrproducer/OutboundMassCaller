@@ -7,6 +7,7 @@ import pytz
 from openai import AsyncOpenAI
 
 import db
+from scoring.lead_scorer import classify_lead_temperature, compute_lead_score
 from whatsapp import build_followup_message, send_whatsapp_message
 
 SUMMARY_MODEL = "gpt-4.1-nano"
@@ -135,7 +136,18 @@ Return ONLY valid JSON. No markdown.
             "mujhe call mat karo",
         ]
         if business_id and lead_phone and (disposition == "do_not_call" or any(p in lowered_transcript for p in stop_phrases)):
-            db.add_to_dnc(str(business_id), lead_phone, "agent_auto_optout", "agent_auto")
+            dnc_row = db.add_to_dnc(str(business_id), lead_phone, "agent_auto_optout", "agent_auto")
+            if dnc_row:
+                try:
+                    from integrations.webhook_dispatcher import dispatch_event
+
+                    await dispatch_event(
+                        str(business_id),
+                        "dnc.added",
+                        {"phone": lead_phone, "reason": "agent_auto_optout", "added_by": "agent_auto"},
+                    )
+                except Exception as dnc_hook_err:
+                    logging.warning("[POST-CALL] dnc webhook dispatch failed: %s", dnc_hook_err)
 
         # Lead status update
         if lead_id:
@@ -145,6 +157,21 @@ Return ONLY valid JSON. No markdown.
                 db.update_lead_status(lead_id, "scheduled")
             else:
                 db.update_lead_status(lead_id, "completed")
+
+            try:
+                latest_lead = db.get_lead(lead_id) or {}
+                history = db.get_call_history_for_lead(lead_id)
+                score, factors = compute_lead_score(latest_lead, history)
+                temperature = classify_lead_temperature(score)
+                db.update_lead(
+                    lead_id,
+                    score=score,
+                    score_factors=factors,
+                    score_updated_at=datetime.utcnow().isoformat(),
+                    temperature=temperature,
+                )
+            except Exception as score_err:
+                logging.warning("[POST-CALL] lead score update failed for %s: %s", lead_id, score_err)
 
         # Smart retry scheduling
         if lead_id and campaign_id and disposition in {"no_answer", "busy", "failed", "voicemail"}:
@@ -180,16 +207,28 @@ Return ONLY valid JSON. No markdown.
 
         # Automated WhatsApp follow-up
         send_followup = bool(call_row.get("was_booked")) or disposition in {"interested", "callback_requested"}
+        booking_row = None
+        booking_time = None
+        if call_row.get("was_booked") and business_id:
+            bookings = db.get_bookings(str(business_id), limit=200)
+            for b in bookings:
+                if str(b.get("call_id")) == str(call_id):
+                    booking_row = b
+                    booking_time = str(b.get("start_time"))
+                    break
+            if booking_row:
+                db.create_notification(
+                    business_id=str(business_id),
+                    type="booking",
+                    title="New Booking",
+                    body=f"{lead_name} booked for {booking_time}",
+                    resource_type="booking",
+                    resource_id=str(booking_row.get("id")),
+                )
+
         if send_followup and business_id and lead_phone:
             business = db.get_business(str(business_id))
             if business and business.get("whatsapp_instance") and business.get("whatsapp_token"):
-                booking_time = None
-                if call_row.get("was_booked"):
-                    bookings = db.get_bookings(str(business_id), limit=100)
-                    for b in bookings:
-                        if str(b.get("call_id")) == str(call_id):
-                            booking_time = str(b.get("start_time"))
-                            break
                 message = build_followup_message(
                     "booked" if call_row.get("was_booked") else disposition,
                     lead_name,
@@ -205,6 +244,118 @@ Return ONLY valid JSON. No markdown.
                     db.update_call(room_id, whatsapp_sent=True)
                 else:
                     logging.error("[POST-CALL] WhatsApp send failed for room_id=%s", room_id)
+
+            # Optional SMS follow-up
+            try:
+                if business and bool(agent_cfg.get("sms_followup_enabled")) and business.get("sms_provider"):
+                    from integrations.sms import send_sms
+
+                    sms_template = None
+                    if call_row.get("was_booked"):
+                        sms_template = agent_cfg.get("sms_template_booked")
+                    elif disposition in {"interested", "callback_requested"}:
+                        sms_template = agent_cfg.get("sms_template_interested")
+                    sms_message = sms_template or build_followup_message(
+                        "booked" if call_row.get("was_booked") else disposition,
+                        lead_name,
+                        booking_time=booking_time,
+                    )
+                    sms_sent = await send_sms(
+                        provider=business.get("sms_provider"),
+                        api_key=business.get("sms_api_key"),
+                        sender_id=business.get("sms_sender_id"),
+                        phone=lead_phone,
+                        message=sms_message,
+                    )
+                    if sms_sent:
+                        db.update_call(room_id, sms_sent=True)
+            except Exception as sms_err:
+                logging.warning("[POST-CALL] SMS follow-up failed for room_id=%s error=%s", room_id, sms_err)
+
+            # Optional email follow-up
+            try:
+                if (lead or {}).get("email") and bool(agent_cfg.get("email_followup_enabled")):
+                    from integrations.email_sender import send_followup_email
+
+                    email_sent = await send_followup_email(
+                        smtp_host=os.environ.get("SMTP_HOST"),
+                        smtp_port=os.environ.get("SMTP_PORT", "587"),
+                        smtp_user=os.environ.get("SMTP_USER"),
+                        smtp_pass=os.environ.get("SMTP_PASS"),
+                        to_email=(lead or {}).get("email"),
+                        lead_name=lead_name,
+                        disposition="booked" if call_row.get("was_booked") else disposition,
+                        booking_time=booking_time,
+                    )
+                    if email_sent:
+                        db.update_call(room_id, email_sent=True)
+            except Exception as email_err:
+                logging.warning("[POST-CALL] email follow-up failed for room_id=%s error=%s", room_id, email_err)
+
+            # Optional HubSpot sync
+            try:
+                if business and business.get("hubspot_sync_enabled"):
+                    from integrations.hubspot import sync_call_to_hubspot
+
+                    await sync_call_to_hubspot(
+                        business.get("hubspot_api_key"),
+                        db.get_call_by_room(room_id) or call_row,
+                        lead or {},
+                    )
+            except Exception as hub_err:
+                logging.warning("[POST-CALL] hubspot sync failed for room_id=%s error=%s", room_id, hub_err)
+
+            # Optional calendar sync for bookings
+            try:
+                if booking_row and business and business.get("gcal_sync_enabled") and business.get("gcal_calendar_id"):
+                    from integrations.gcal import create_calendar_event
+
+                    event_id = await create_calendar_event(
+                        calendar_id=str(business.get("gcal_calendar_id")),
+                        summary=f"Appointment: {lead_name}",
+                        description=str((booking_row or {}).get("notes") or ""),
+                        start_time=str((booking_row or {}).get("start_time")),
+                        attendee_email=(lead or {}).get("email"),
+                    )
+                    if event_id:
+                        db.update_booking_gcal_event(str(booking_row.get("id")), event_id)
+            except Exception as gcal_err:
+                logging.warning("[POST-CALL] gcal sync failed for room_id=%s error=%s", room_id, gcal_err)
+
+            # Optional slack notification
+            try:
+                if booking_row and business and business.get("slack_webhook_url"):
+                    from integrations.slack import build_booking_notification, send_slack_notification
+
+                    payload = build_booking_notification(
+                        lead_name=lead_name,
+                        phone=lead_phone,
+                        campaign_name=str((db.get_campaign(str(campaign_id)) or {}).get("name") or "Campaign"),
+                        booking_time=booking_time,
+                    )
+                    await send_slack_notification(
+                        webhook_url=business.get("slack_webhook_url"),
+                        text=payload.get("text", "New booking"),
+                        blocks=payload.get("blocks"),
+                    )
+            except Exception as slack_err:
+                logging.warning("[POST-CALL] slack notify failed for room_id=%s error=%s", room_id, slack_err)
+
+        # Outbound webhook events
+        try:
+            if business_id:
+                from integrations.webhook_dispatcher import dispatch_event
+
+                latest_call = db.get_call_by_room(room_id) or call_row or {}
+                await dispatch_event(str(business_id), "call.completed", latest_call)
+                if bool(latest_call.get("was_booked")):
+                    await dispatch_event(
+                        str(business_id),
+                        "call.booked",
+                        {"call": latest_call, "lead": lead or {}, "booking": booking_row or {}},
+                    )
+        except Exception as wh_err:
+            logging.warning("[POST-CALL] webhook dispatch failed for room_id=%s error=%s", room_id, wh_err)
 
         # Trigger post-call survey (non-blocking)
         try:

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, File, FastAPI, HTTPException, Header, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, File, Form, FastAPI, HTTPException, Header, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from livekit import api as lk_api
@@ -50,6 +50,8 @@ _import_jobs: dict[str, dict] = {}
 _reminder_task: Optional[asyncio.Task] = None
 _spam_monitor_task: Optional[asyncio.Task] = None
 _simulator_cleanup_task: Optional[asyncio.Task] = None
+_lead_temperature_task: Optional[asyncio.Task] = None
+_reports_task: Optional[asyncio.Task] = None
 _simulator_sessions: dict[str, dict] = {}
 _last_transcript_cursor: Optional[str] = None
 _shutdown_event = asyncio.Event()
@@ -189,7 +191,7 @@ def register_signal_handlers():
 
 @app.on_event("startup")
 async def startup_event():
-    global _live_broadcast_task, _scheduled_campaigns_task, _reminder_task, _spam_monitor_task, _simulator_cleanup_task
+    global _live_broadcast_task, _scheduled_campaigns_task, _reminder_task, _spam_monitor_task, _simulator_cleanup_task, _lead_temperature_task, _reports_task
     register_signal_handlers()
     _shutdown_event.clear()
     try:
@@ -217,6 +219,12 @@ async def startup_event():
         _spam_monitor_task = asyncio.create_task(_spam_monitor_loop())
     if _simulator_cleanup_task is None or _simulator_cleanup_task.done():
         _simulator_cleanup_task = asyncio.create_task(_simulator_cleanup_loop())
+    if _lead_temperature_task is None or _lead_temperature_task.done():
+        _lead_temperature_task = asyncio.create_task(_lead_temperature_refresh_loop())
+    if _reports_task is None or _reports_task.done():
+        from reports.email_reporter import run_scheduled_reports
+
+        _reports_task = asyncio.create_task(run_scheduled_reports())
 
 
 @app.on_event("shutdown")
@@ -240,7 +248,15 @@ async def on_shutdown():
     except Exception as e:
         logging.warning("[SHUTDOWN] Unable to stop dialers cleanly: %s", e)
 
-    for task in (_live_broadcast_task, _scheduled_campaigns_task, _reminder_task, _spam_monitor_task, _simulator_cleanup_task):
+    for task in (
+        _live_broadcast_task,
+        _scheduled_campaigns_task,
+        _reminder_task,
+        _spam_monitor_task,
+        _simulator_cleanup_task,
+        _lead_temperature_task,
+        _reports_task,
+    ):
         if task and not task.done():
             task.cancel()
 
@@ -468,6 +484,44 @@ class LeadUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class LeadTagBody(BaseModel):
+    business_id: str
+    tag: str
+
+
+class LeadEnrichBody(BaseModel):
+    business_id: str
+
+
+class LeadDuplicateCheckBody(BaseModel):
+    business_id: str
+    phones: List[str]
+
+
+class SheetsImportBody(BaseModel):
+    sheet_url: str
+    column_map: dict
+    business_id: str
+
+
+class ObjectionCreateBody(BaseModel):
+    trigger_phrases: List[str]
+    response: str
+    priority: int = 1
+
+
+class ObjectionUpdateBody(BaseModel):
+    trigger_phrases: Optional[List[str]] = None
+    response: Optional[str] = None
+    priority: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class PronunciationCreateBody(BaseModel):
+    word: str
+    pronunciation: str
+
+
 class DemoStartBody(BaseModel):
     agent_id: str
     business_id: str
@@ -572,6 +626,12 @@ class CampaignResumeBody(BaseModel):
     business_id: str
 
 
+class TestCallBody(BaseModel):
+    business_id: str
+    phone: str
+    agent_id: str
+
+
 class CampaignSequenceCreateBody(BaseModel):
     business_id: str
     name: str
@@ -620,6 +680,66 @@ class GDPRDeleteBody(BaseModel):
     business_id: str
     phone: str
     requestor_name: str
+
+
+class ScheduledReportCreateBody(BaseModel):
+    business_id: str
+    report_type: str
+    frequency: str = "daily"
+    send_to: List[str]
+    campaign_id: Optional[str] = None
+
+
+class WebhookCreateBody(BaseModel):
+    business_id: str
+    name: str
+    url: str
+    events: List[str]
+    secret: Optional[str] = None
+
+
+class WebhookUpdateBody(BaseModel):
+    name: Optional[str] = None
+    url: Optional[str] = None
+    events: Optional[List[str]] = None
+    secret: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class HubspotImportBody(BaseModel):
+    business_id: str
+    campaign_id: str
+    list_id: Optional[str] = None
+
+
+class SlackTestBody(BaseModel):
+    business_id: str
+
+
+class MarkAllReadBody(BaseModel):
+    business_id: str
+
+
+class BulkLeadIdsBody(BaseModel):
+    business_id: str
+    lead_ids: List[str]
+
+
+class BulkLeadStatusBody(BaseModel):
+    business_id: str
+    lead_ids: List[str]
+    status: str
+
+
+class BulkLeadTagBody(BaseModel):
+    business_id: str
+    lead_ids: List[str]
+    tag: str
+
+
+class BulkCampaignIdsBody(BaseModel):
+    business_id: str
+    campaign_ids: List[str]
 
 
 def _lk_client() -> lk_api.LiveKitAPI:
@@ -856,6 +976,34 @@ async def _simulator_cleanup_loop():
         except Exception as e:
             logging.warning("[SIM] cleanup loop error: %s", e)
         await asyncio.sleep(60)
+
+
+async def _lead_temperature_refresh_loop():
+    from scoring.lead_scorer import classify_lead_temperature, compute_lead_score
+
+    while not _shutdown_event.is_set():
+        try:
+            active_campaigns = db.get_campaigns_active()
+            for campaign in active_campaigns:
+                campaign_id = str(campaign.get("id"))
+                leads = db.get_leads(campaign_id, status=None, limit=50000, offset=0)
+                for lead in leads:
+                    lead_id = str(lead.get("id"))
+                    if not lead_id:
+                        continue
+                    history = db.get_call_history_for_lead(lead_id)
+                    score, factors = compute_lead_score(lead, history)
+                    temp = classify_lead_temperature(score)
+                    db.update_lead(
+                        lead_id,
+                        score=score,
+                        score_factors=factors,
+                        score_updated_at=datetime_now_iso(),
+                        temperature=temp,
+                    )
+        except Exception as e:
+            logging.warning("[LEAD-SCORE] refresh loop error: %s", e)
+        await asyncio.sleep(600)
 
 
 # Group D: Auth / API keys / GDPR / Audit
@@ -1177,6 +1325,56 @@ def delete_business(id: str):
     return {"success": True}
 
 
+@app.get("/api/onboarding/status")
+def onboarding_status(business_id: str = Query(...)):
+    business = db.get_business(business_id)
+    if not business:
+        return _success({"complete": False, "missing": ["business", "sip_trunk", "agent"]})
+    trunks = db.get_sip_trunks(business_id)
+    agents = db.get_agents(business_id)
+    missing = []
+    if not trunks:
+        missing.append("sip_trunk")
+    if not agents:
+        missing.append("agent")
+    return _success({"complete": len(missing) == 0, "missing": missing})
+
+
+@app.post("/api/test-call")
+async def test_call(body: TestCallBody):
+    phone = _normalize_phone(body.phone)
+    if not _is_valid_phone(phone):
+        return _error("Invalid phone format", 400)
+    agent = db.get_agent(body.agent_id)
+    if not agent or str(agent.get("business_id")) != str(body.business_id):
+        return _error("Agent not found", 404)
+    trunk = next((t for t in db.get_sip_trunks(body.business_id) if t.get("is_active", True)), None)
+    if not trunk:
+        return _error("No active SIP trunk found", 404)
+
+    result = await dispatch_outbound_call(
+        phone=phone,
+        agent_id=body.agent_id,
+        sip_trunk_id=str(trunk.get("id")),
+        business_id=body.business_id,
+        campaign_id=None,
+        lead_id=None,
+        script_override=None,
+        call_attempt_number=1,
+    )
+    call_row = db.create_call(
+        lead_id=None,
+        campaign_id=None,
+        agent_id=body.agent_id,
+        sip_trunk_id=str(trunk.get("id")),
+        business_id=body.business_id,
+        phone=phone,
+        room_id=result.get("room_id"),
+        call_attempt_number=1,
+    )
+    return _success({"call_id": str((call_row or {}).get("id") or ""), "room_id": result.get("room_id"), "status": "dispatched"})
+
+
 # SIP Trunks
 
 @app.post("/api/sip-trunks")
@@ -1295,6 +1493,77 @@ def activate_agent(id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"success": True}
+
+
+@app.get("/api/agents/{agent_id}/objections")
+def list_objection_handlers(agent_id: str, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    return _success(db.get_objection_handlers(agent_id))
+
+
+@app.post("/api/agents/{agent_id}/objections")
+def create_objection_handler_api(agent_id: str, body: ObjectionCreateBody, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    row = db.create_objection_handler(agent_id, body.trigger_phrases, body.response, body.priority)
+    if not row:
+        return _error("Failed to create objection handler", 400)
+    return _success(row)
+
+
+@app.put("/api/agents/{agent_id}/objections/{id}")
+def update_objection_handler_api(agent_id: str, id: str, body: ObjectionUpdateBody, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    row = db.update_objection_handler(id, **body.model_dump(exclude_none=True))
+    if not row:
+        return _error("Objection handler not found", 404)
+    return _success(row)
+
+
+@app.delete("/api/agents/{agent_id}/objections/{id}")
+def delete_objection_handler_api(agent_id: str, id: str, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    ok = db.delete_objection_handler(id)
+    if not ok:
+        return _error("Objection handler not found", 404)
+    return _success({"deleted": True})
+
+
+@app.get("/api/agents/{agent_id}/pronunciation")
+def list_pronunciation(agent_id: str, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    return _success(db.get_pronunciation_guide(agent_id))
+
+
+@app.post("/api/agents/{agent_id}/pronunciation")
+def create_pronunciation(agent_id: str, body: PronunciationCreateBody, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    row = db.create_pronunciation_entry(agent_id, body.word, body.pronunciation)
+    if not row:
+        return _error("Failed to create pronunciation entry", 400)
+    return _success(row)
+
+
+@app.delete("/api/agents/{agent_id}/pronunciation/{id}")
+def delete_pronunciation(agent_id: str, id: str, business_id: str = Query(...)):
+    agent = db.get_agent(agent_id)
+    if not agent or str(agent.get("business_id")) != str(business_id):
+        return _error("Agent not found", 404)
+    ok = db.delete_pronunciation_entry(id)
+    if not ok:
+        return _error("Pronunciation entry not found", 404)
+    return _success({"deleted": True})
 
 
 # Campaigns
@@ -1688,64 +1957,63 @@ async def upload_leads(id: str, file: UploadFile = File(...)):
 
 
 @app.post("/api/campaigns/{campaign_id}/leads/import")
-async def import_leads(campaign_id: str, request: Request, business_id: str = Query(...), file: UploadFile = File(...)):
+async def import_leads(
+    campaign_id: str,
+    request: Request,
+    business_id: str = Query(...),
+    file: UploadFile = File(...),
+    column_map: str = Form("{}"),
+):
+    from importers.csv_importer import parse_and_validate_csv
+
     logging.info("[LEADS] import requested campaign_id=%s business_id=%s", campaign_id, business_id)
     campaign = db.get_campaign(campaign_id)
-    if not campaign:
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
         return _error("Campaign not found", 404)
 
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
         return _error("File too large (max 10MB)", 400)
 
-    text = content.decode("utf-8-sig", errors="ignore")
-    reader = csv.DictReader(io.StringIO(text))
+    try:
+        map_obj = json.loads(column_map or "{}")
+        if not isinstance(map_obj, dict):
+            map_obj = {}
+    except Exception:
+        map_obj = {}
 
-    errors = []
-    imported_rows = []
-    seen_csv = set()
-    duplicates_skipped = 0
-    dnc_skipped = 0
-    invalid_skipped = 0
+    if "phone" not in map_obj:
+        map_obj["phone"] = "phone"
 
-    existing_phones = {(_normalize_phone(x.get("phone")) or "") for x in db.get_leads(campaign_id, limit=50000, offset=0)}
-    row_idx = 1
-    for row in reader:
-        row_idx += 1
-        if row_idx > 50001:
-            return _error("Max 50,000 rows allowed", 400)
+    dnc_rows = db.get_dnc_list(business_id, limit=100000, offset=0)
+    dnc_phones = {_normalize_phone(x.get("phone") or "") for x in dnc_rows}
 
-        phone = _normalize_phone(row.get("phone") or "")
-        if not phone or not _is_valid_phone(phone):
-            invalid_skipped += 1
-            errors.append({"row": row_idx, "phone": phone, "reason": "invalid_phone"})
+    parsed = parse_and_validate_csv(
+        file_bytes=content,
+        campaign_id=campaign_id,
+        business_id=business_id,
+        column_map=map_obj,
+        dnc_phones=dnc_phones,
+    )
+    valid_leads = parsed.get("valid_leads", [])
+    stats = parsed.get("stats", {})
+    errors = parsed.get("errors", [])
+
+    existing_phones = {_normalize_phone(x.get("phone") or "") for x in db.get_leads(campaign_id, limit=50000, offset=0)}
+    filtered = []
+    duplicates_skipped_existing = 0
+    for lead in valid_leads:
+        phone = _normalize_phone(lead.get("phone") or "")
+        if phone in existing_phones:
+            duplicates_skipped_existing += 1
             continue
-        if phone in seen_csv or phone in existing_phones:
-            duplicates_skipped += 1
-            continue
-        if db.is_dnc(str(business_id), phone):
-            dnc_skipped += 1
-            continue
-        seen_csv.add(phone)
+        filtered.append(lead)
 
-        custom_data = {}
-        raw_custom = row.get("custom_data")
-        if raw_custom:
-            try:
-                custom_data = json.loads(raw_custom)
-            except Exception:
-                custom_data = {"raw": raw_custom}
-        imported_rows.append(
-            {
-                "phone": phone,
-                "name": row.get("name"),
-                "email": row.get("email"),
-                "language": row.get("language") or "hi-IN",
-                "custom_data": custom_data,
-            }
-        )
+    inserted = db.bulk_create_leads(campaign_id, business_id, filtered)
+    duplicates_skipped = int(stats.get("duplicates_in_file") or 0) + duplicates_skipped_existing
+    dnc_skipped = int(stats.get("dnc_skipped") or 0)
+    invalid_skipped = int(stats.get("invalid_phone") or 0)
 
-    inserted = db.bulk_create_leads(campaign_id, business_id, imported_rows)
     result = {
         "imported": inserted,
         "duplicates_skipped": duplicates_skipped,
@@ -1756,6 +2024,7 @@ async def import_leads(campaign_id: str, request: Request, business_id: str = Qu
     job_id = uuid.uuid4().hex
     _import_jobs[job_id] = {"status": "completed", "result": result, "created_at": datetime.utcnow().isoformat()}
     result["job_id"] = job_id
+
     actor = _actor_from_request(request)
     db.log_audit(
         business_id=business_id,
@@ -1772,6 +2041,14 @@ async def import_leads(campaign_id: str, request: Request, business_id: str = Qu
         ip_address=actor["ip"],
         user_agent=actor["ua"],
     )
+    db.create_notification(
+        business_id=business_id,
+        type="import_complete",
+        title="Lead Import Completed",
+        body=f"Imported {inserted} leads into campaign {campaign_id}",
+        resource_type="campaign",
+        resource_id=campaign_id,
+    )
     return _success(result)
 
 
@@ -1785,7 +2062,18 @@ def get_job(job_id: str, business_id: str = Query(...)):
 
 
 @app.get("/api/campaigns/{id}/leads")
-def get_campaign_leads(id: str, status: Optional[str] = Query(default=None), limit: int = 100, offset: int = 0):
+def get_campaign_leads(
+    id: str,
+    status: Optional[str] = Query(default=None),
+    tag: Optional[str] = Query(default=None),
+    temperature: Optional[str] = Query(default=None),
+    limit: int = 100,
+    offset: int = 0,
+):
+    if tag:
+        return db.get_leads_by_tag(id, tag)
+    if temperature:
+        return db.get_leads_by_temperature(id, temperature)
     return db.get_leads(id, status=status, limit=limit, offset=offset)
 
 
@@ -1795,6 +2083,156 @@ def update_lead(id: str, body: LeadUpdate):
     if not ok:
         raise HTTPException(status_code=404, detail="Lead not found or no updates")
     return {"success": True}
+
+
+@app.post("/api/leads/{id}/tags")
+def add_tag_to_lead(id: str, body: LeadTagBody):
+    logging.info("[LEADS] add tag lead_id=%s business_id=%s tag=%s", id, body.business_id, body.tag)
+    lead = db.get_lead(id)
+    if not lead or str(lead.get("business_id")) != str(body.business_id):
+        return _error("Lead not found", 404)
+    ok = db.add_lead_tag(id, body.tag)
+    if not ok:
+        return _error("Failed to add tag", 400)
+    return _success({"updated": True})
+
+
+@app.delete("/api/leads/{id}/tags/{tag}")
+def remove_tag_from_lead(id: str, tag: str, business_id: str = Query(...)):
+    logging.info("[LEADS] remove tag lead_id=%s business_id=%s tag=%s", id, business_id, tag)
+    lead = db.get_lead(id)
+    if not lead or str(lead.get("business_id")) != str(business_id):
+        return _error("Lead not found", 404)
+    ok = db.remove_lead_tag(id, tag)
+    if not ok:
+        return _error("Failed to remove tag", 400)
+    return _success({"updated": True})
+
+
+@app.get("/api/tags")
+def list_tags(business_id: str = Query(...)):
+    logging.info("[LEADS] list tags business_id=%s", business_id)
+    return _success(db.get_all_tags(business_id))
+
+
+@app.get("/api/leads/{id}/timeline")
+def lead_timeline(id: str, business_id: str = Query(...)):
+    logging.info("[LEADS] timeline lead_id=%s business_id=%s", id, business_id)
+    lead = db.get_lead(id)
+    if not lead or str(lead.get("business_id")) != str(business_id):
+        return _error("Lead not found", 404)
+    return _success(db.get_lead_timeline(id))
+
+
+@app.post("/api/leads/{id}/enrich")
+async def enrich_single_lead(id: str, body: LeadEnrichBody):
+    from enrichment.enricher import enrich_lead
+
+    logging.info("[LEADS] enrich lead_id=%s business_id=%s", id, body.business_id)
+    lead = db.get_lead(id)
+    if not lead or str(lead.get("business_id")) != str(body.business_id):
+        return _error("Lead not found", 404)
+    updates = await enrich_lead(str(lead.get("phone") or ""), lead)
+    if not updates:
+        return _success({"updated": False, "changes": {}})
+    db.update_lead(id, **updates)
+    return _success({"updated": True, "changes": updates})
+
+
+@app.post("/api/campaigns/{id}/enrich-all")
+async def enrich_campaign_leads(id: str, body: LeadEnrichBody):
+    from enrichment.enricher import enrich_lead
+
+    logging.info("[LEADS] enrich-all campaign_id=%s business_id=%s", id, body.business_id)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    leads = db.get_leads(id, status=None, limit=50000, offset=0)
+    updated = 0
+    for lead in leads:
+        lead_id = str(lead.get("id") or "")
+        if not lead_id:
+            continue
+        changes = await enrich_lead(str(lead.get("phone") or ""), lead)
+        if changes:
+            if db.update_lead(lead_id, **changes):
+                updated += 1
+    return _success({"updated": updated, "total": len(leads)})
+
+
+@app.post("/api/campaigns/{campaign_id}/leads/import-from-sheets")
+async def import_leads_from_sheets(campaign_id: str, body: SheetsImportBody, request: Request):
+    from importers.csv_importer import parse_and_validate_csv
+    from importers.sheets_importer import fetch_sheet_as_csv
+
+    logging.info("[LEADS] import-from-sheets campaign_id=%s business_id=%s", campaign_id, body.business_id)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+
+    try:
+        csv_bytes = fetch_sheet_as_csv(body.sheet_url)
+    except Exception as e:
+        return _error(f"Failed to fetch sheet: {e}", 400)
+
+    dnc_rows = db.get_dnc_list(body.business_id, limit=100000, offset=0)
+    dnc_phones = {_normalize_phone(x.get("phone") or "") for x in dnc_rows}
+    parsed = parse_and_validate_csv(
+        file_bytes=csv_bytes,
+        campaign_id=campaign_id,
+        business_id=body.business_id,
+        column_map=body.column_map or {"phone": "phone"},
+        dnc_phones=dnc_phones,
+    )
+
+    valid_leads = parsed.get("valid_leads", [])
+    stats = parsed.get("stats", {})
+    errors = parsed.get("errors", [])
+    existing_phones = {_normalize_phone(x.get("phone") or "") for x in db.get_leads(campaign_id, limit=50000, offset=0)}
+
+    filtered = []
+    duplicates_skipped_existing = 0
+    for lead in valid_leads:
+        phone = _normalize_phone(lead.get("phone") or "")
+        if phone in existing_phones:
+            duplicates_skipped_existing += 1
+            continue
+        filtered.append(lead)
+
+    inserted = db.bulk_create_leads(campaign_id, body.business_id, filtered)
+    result = {
+        "imported": inserted,
+        "duplicates_skipped": int(stats.get("duplicates_in_file") or 0) + duplicates_skipped_existing,
+        "dnc_skipped": int(stats.get("dnc_skipped") or 0),
+        "invalid_skipped": int(stats.get("invalid_phone") or 0),
+        "errors": errors,
+    }
+    actor = _actor_from_request(request)
+    db.log_audit(
+        business_id=body.business_id,
+        user_id=actor["user_id"],
+        action="lead.import_from_sheets",
+        resource_type="lead",
+        resource_id=str(campaign_id),
+        new_value=result,
+        ip_address=actor["ip"],
+        user_agent=actor["ua"],
+    )
+    return _success(result)
+
+
+@app.post("/api/leads/check-duplicates")
+def check_duplicate_leads(body: LeadDuplicateCheckBody):
+    logging.info("[LEADS] check-duplicates business_id=%s count=%s", body.business_id, len(body.phones))
+    dup_map = db.find_duplicate_leads_across_campaigns(body.business_id, body.phones)
+    details = {}
+    for phone, campaign_ids in (dup_map or {}).items():
+        names = []
+        for cid in campaign_ids:
+            campaign = db.get_campaign(cid) or {}
+            names.append(campaign.get("name") or cid)
+        details[phone] = names
+    return _success({"duplicate_phones": details})
 
 
 @app.post("/api/leads/reschedule")
@@ -1824,6 +2262,18 @@ def add_dnc(body: DNCAddBody, request: Request):
         ip_address=actor["ip"],
         user_agent=actor["ua"],
     )
+    try:
+        from integrations.webhook_dispatcher import dispatch_event
+
+        asyncio.create_task(
+            dispatch_event(
+                body.business_id,
+                "dnc.added",
+                {"phone": body.phone, "reason": body.reason, "added_by": body.added_by},
+            )
+        )
+    except Exception:
+        pass
     return _success(row)
 
 
@@ -1888,6 +2338,15 @@ def get_call_transcript(room_id: str):
     return db.get_transcript(room_id)
 
 
+@app.get("/api/calls/inbound")
+def get_inbound_calls_list(
+    business_id: str = Query(...),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return _success(db.get_inbound_calls(business_id, limit=limit, offset=offset))
+
+
 @app.get("/api/calls/{room_id}")
 def get_call(
     room_id: str,
@@ -1895,10 +2354,6 @@ def get_call(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    if room_id == "inbound":
-        if not business_id:
-            raise HTTPException(status_code=400, detail="business_id is required for inbound calls")
-        return _success(db.get_inbound_calls(business_id, limit=limit, offset=offset))
     row = db.get_call_by_room(room_id)
     if not row:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -2273,6 +2728,113 @@ def analytics_cost(
     return _success(db.get_cost_report(business_id, from_date, to_date))
 
 
+@app.get("/api/analytics/heatmap")
+def analytics_heatmap(business_id: str = Query(...), days: int = Query(30, ge=1, le=365)):
+    logging.info("[ANALYTICS] heatmap business_id=%s days=%s", business_id, days)
+    return _success(db.get_call_heatmap(business_id, days=days))
+
+
+@app.get("/api/analytics/agent-comparison")
+def analytics_agent_comparison(
+    business_id: str = Query(...),
+    days: int = Query(7, ge=1, le=90),
+    campaign_id: Optional[str] = Query(default=None),
+):
+    logging.info(
+        "[ANALYTICS] agent-comparison business_id=%s days=%s campaign_id=%s",
+        business_id,
+        days,
+        campaign_id,
+    )
+    return _success(db.get_agent_comparison(business_id, campaign_id=campaign_id, days=days))
+
+
+@app.get("/api/analytics/cost-per-acquisition")
+def analytics_cpa(
+    business_id: str = Query(...),
+    from_date: str = Query(..., alias="from"),
+    to_date: str = Query(..., alias="to"),
+):
+    logging.info("[ANALYTICS] cpa business_id=%s from=%s to=%s", business_id, from_date, to_date)
+    return _success(db.get_cost_per_acquisition(business_id, from_date, to_date))
+
+
+@app.get("/api/analytics/sentiment-trend")
+def analytics_sentiment_trend(campaign_id: str = Query(...), business_id: str = Query(...), days: int = Query(7, ge=1, le=90)):
+    logging.info("[ANALYTICS] sentiment-trend campaign_id=%s business_id=%s days=%s", campaign_id, business_id, days)
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_sentiment_trend(campaign_id, days=days))
+
+
+@app.get("/api/reports/scheduled")
+def list_scheduled_reports(business_id: str = Query(...)):
+    logging.info("[REPORT] list scheduled business_id=%s", business_id)
+    return _success(db.get_scheduled_reports(business_id))
+
+
+@app.post("/api/reports/scheduled")
+def create_scheduled_report_api(body: ScheduledReportCreateBody):
+    logging.info("[REPORT] create scheduled business_id=%s type=%s", body.business_id, body.report_type)
+    row = db.create_scheduled_report(
+        business_id=body.business_id,
+        report_type=body.report_type,
+        frequency=body.frequency,
+        send_to=body.send_to,
+        campaign_id=body.campaign_id,
+    )
+    if not row:
+        return _error("Failed to create scheduled report", 400)
+    return _success(row)
+
+
+@app.delete("/api/reports/scheduled/{id}")
+def delete_scheduled_report_api(id: str, business_id: str = Query(...)):
+    rows = db.get_scheduled_reports(business_id)
+    if not any(str(x.get("id")) == str(id) for x in rows):
+        return _error("Scheduled report not found", 404)
+    ok = db.delete_scheduled_report(id)
+    if not ok:
+        return _error("Scheduled report not found", 404)
+    return _success({"deleted": True})
+
+
+@app.post("/api/reports/send-now/{id}")
+async def send_report_now(id: str, business_id: str = Query(...)):
+    from reports.email_reporter import build_daily_summary_html, send_report_email
+
+    rows = db.get_scheduled_reports(business_id)
+    report = next((x for x in rows if str(x.get("id")) == str(id)), None)
+    if not report:
+        return _error("Scheduled report not found", 404)
+
+    stats = db.get_platform_stats(business_id)
+    html = build_daily_summary_html(business_id, stats)
+    subject = f"RapidXAI Report: {report.get('report_type', 'daily_summary')}"
+    sent = await send_report_email(list(report.get("send_to") or []), subject, html)
+    if sent:
+        db.update_report_last_sent(id)
+    return _success({"sent": sent})
+
+
+@app.get("/api/reports/campaign/{campaign_id}/pdf")
+def campaign_report_pdf(campaign_id: str, business_id: str = Query(...)):
+    from fastapi import Response
+    from reports.pdf_exporter import generate_campaign_report_pdf
+
+    campaign = db.get_campaign(campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    stats = db.get_campaign_stats(campaign_id)
+    funnel = db.get_conversion_funnel(campaign_id)
+    calls = db.get_calls(campaign_id=campaign_id, business_id=business_id, limit=50, offset=0)
+    pdf_bytes = generate_campaign_report_pdf(campaign_id, stats, calls, funnel)
+    filename = f"campaign_{campaign_id}_{datetime.utcnow().date().isoformat()}.pdf"
+    headers = {"Content-Disposition": f'attachment; filename=\"{filename}\"'}
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
 # Group J: Holidays
 
 @app.get("/api/holidays")
@@ -2530,7 +3092,7 @@ async def simulator_message(session_id: str, body: SimulatorMessageBody):
     if not payload:
         return _error("Simulator session not found", 404)
     sim = payload["simulator"]
-    handlers = []
+    handlers = db.get_objection_handlers(str(payload.get("agent_id")))
     response, objection = await sim.send_message(body.content, objection_handlers=handlers)
     return _success(
         {
@@ -2565,6 +3127,226 @@ def simulator_delete(session_id: str):
     if not existed:
         return _error("Simulator session not found", 404)
     return _success({"deleted": True})
+
+
+# Notifications / Activity / Search
+
+@app.get("/api/notifications")
+def list_notifications(
+    business_id: str = Query(...),
+    unread_only: bool = Query(False),
+    limit: int = Query(50, ge=1, le=500),
+):
+    logging.info("[NOTIFY] list business_id=%s unread_only=%s", business_id, unread_only)
+    return _success(db.get_notifications(business_id, unread_only=unread_only, limit=limit))
+
+
+@app.post("/api/notifications/{id}/read")
+def mark_notification_as_read(id: str, business_id: str = Query(...)):
+    rows = db.get_notifications(business_id, unread_only=False, limit=1000)
+    if not any(str(r.get("id")) == str(id) for r in rows):
+        return _error("Notification not found", 404)
+    ok = db.mark_notification_read(id)
+    if not ok:
+        return _error("Notification not found", 404)
+    return _success({"read": True})
+
+
+@app.post("/api/notifications/mark-all-read")
+def mark_notifications_read(body: MarkAllReadBody):
+    count = db.mark_all_read(body.business_id)
+    return _success({"updated": count})
+
+
+@app.get("/api/notifications/unread-count")
+def notifications_unread_count(business_id: str = Query(...)):
+    return _success({"count": db.get_unread_count(business_id)})
+
+
+@app.get("/api/activity-feed")
+def activity_feed(
+    business_id: str = Query(...),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    return _success(db.get_activity_feed(business_id, limit=limit, offset=offset))
+
+
+@app.get("/api/search")
+def search_api(business_id: str = Query(...), q: str = Query(...), limit: int = Query(20, ge=1, le=100)):
+    return _success({"results": db.global_search(business_id, q, limit=limit)})
+
+
+# Bulk actions
+
+@app.post("/api/leads/bulk-dnc")
+def bulk_dnc(body: BulkLeadIdsBody):
+    leads = [db.get_lead(x) for x in body.lead_ids]
+    phones = [str((l or {}).get("phone") or "") for l in leads if l and str(l.get("business_id")) == str(body.business_id)]
+    added = db.bulk_add_dnc(body.business_id, phones, reason="bulk_action")
+    for lead in leads:
+        if lead and str(lead.get("business_id")) == str(body.business_id):
+            db.update_lead_status(str(lead.get("id")), "dnc")
+    return _success({"added": added})
+
+
+@app.patch("/api/leads/bulk-status")
+def bulk_lead_status(body: BulkLeadStatusBody):
+    affected = db.bulk_update_lead_status(body.lead_ids, body.status)
+    return _success({"updated": affected})
+
+
+@app.post("/api/leads/bulk-tag")
+def bulk_lead_tag(body: BulkLeadTagBody):
+    affected = db.bulk_add_lead_tags(body.lead_ids, body.tag)
+    return _success({"updated": affected})
+
+
+@app.delete("/api/leads/bulk")
+def bulk_delete_lead_api(body: BulkLeadIdsBody):
+    affected = db.bulk_delete_leads(body.lead_ids)
+    return _success({"deleted": affected})
+
+
+@app.post("/api/campaigns/bulk-pause")
+async def bulk_pause_campaigns_api(body: BulkCampaignIdsBody):
+    import dialer
+
+    affected = db.bulk_pause_campaigns(body.campaign_ids)
+    for cid in body.campaign_ids:
+        await dialer.stop_campaign(str(cid))
+    return _success({"updated": affected})
+
+
+@app.post("/api/campaigns/bulk-resume")
+async def bulk_resume_campaigns_api(body: BulkCampaignIdsBody):
+    import dialer
+
+    affected = db.bulk_resume_campaigns(body.campaign_ids)
+    for cid in body.campaign_ids:
+        await dialer.start_campaign(str(cid))
+    return _success({"updated": affected})
+
+
+# Integrations
+
+@app.post("/api/integrations/hubspot/sync-call/{call_id}")
+async def hubspot_sync_call(call_id: str, business_id: str = Query(...)):
+    from integrations.hubspot import sync_call_to_hubspot
+
+    call = next((c for c in db.get_calls(business_id=business_id, limit=200, offset=0) if str(c.get("id")) == str(call_id)), None)
+    if not call:
+        return _error("Call not found", 404)
+    lead = db.get_lead(str(call.get("lead_id"))) if call.get("lead_id") else {}
+    business = db.get_business(business_id) or {}
+    sent = await sync_call_to_hubspot(business.get("hubspot_api_key"), call, lead or {})
+    return _success({"synced": bool(sent)})
+
+
+@app.post("/api/integrations/hubspot/import-contacts")
+async def hubspot_import_contacts(body: HubspotImportBody):
+    from integrations.hubspot import import_contacts_from_hubspot
+
+    campaign = db.get_campaign(body.campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    business = db.get_business(body.business_id) or {}
+    contacts = await import_contacts_from_hubspot(business.get("hubspot_api_key"), list_id=body.list_id)
+    inserted = db.bulk_create_leads(body.campaign_id, body.business_id, contacts)
+    return _success({"imported": inserted, "fetched": len(contacts)})
+
+
+@app.post("/api/integrations/gcal/sync-booking/{booking_id}")
+async def gcal_sync_booking(booking_id: str, business_id: str = Query(...)):
+    from integrations.gcal import create_calendar_event
+
+    bookings = db.get_bookings(business_id=business_id, limit=500)
+    booking = next((b for b in bookings if str(b.get("id")) == str(booking_id)), None)
+    if not booking:
+        return _error("Booking not found", 404)
+    business = db.get_business(business_id) or {}
+    event_id = await create_calendar_event(
+        calendar_id=str(business.get("gcal_calendar_id") or ""),
+        summary=f"Appointment: {booking.get('caller_name') or booking.get('caller_phone')}",
+        description=str(booking.get("notes") or ""),
+        start_time=str(booking.get("start_time")),
+        attendee_email=booking.get("caller_email"),
+    )
+    if event_id:
+        db.update_booking_gcal_event(booking_id, event_id)
+    return _success({"synced": bool(event_id), "event_id": event_id or None})
+
+
+@app.post("/api/integrations/slack/test")
+async def slack_test(body: SlackTestBody):
+    from integrations.slack import send_slack_notification
+
+    business = db.get_business(body.business_id) or {}
+    sent = await send_slack_notification(
+        webhook_url=business.get("slack_webhook_url"),
+        text="RapidXAI integration test notification.",
+    )
+    return _success({"sent": bool(sent)})
+
+
+# Webhooks
+
+@app.get("/api/webhooks")
+def list_webhooks(business_id: str = Query(...)):
+    return _success(db.get_webhooks(business_id))
+
+
+@app.post("/api/webhooks")
+def create_webhook_api(body: WebhookCreateBody):
+    row = db.create_webhook(body.business_id, body.name, body.url, body.events, body.secret)
+    if not row:
+        return _error("Failed to create webhook", 400)
+    return _success(row)
+
+
+@app.put("/api/webhooks/{id}")
+def update_webhook_api(id: str, body: WebhookUpdateBody, business_id: str = Query(...)):
+    existing = [w for w in db.get_webhooks(business_id) if str(w.get("id")) == str(id)]
+    if not existing:
+        return _error("Webhook not found", 404)
+    row = db.update_webhook(id, **body.model_dump(exclude_none=True))
+    if not row:
+        return _error("Webhook not found", 404)
+    return _success(row)
+
+
+@app.delete("/api/webhooks/{id}")
+def delete_webhook_api(id: str, business_id: str = Query(...)):
+    existing = [w for w in db.get_webhooks(business_id) if str(w.get("id")) == str(id)]
+    if not existing:
+        return _error("Webhook not found", 404)
+    ok = db.delete_webhook(id)
+    if not ok:
+        return _error("Webhook not found", 404)
+    return _success({"deleted": True})
+
+
+@app.get("/api/webhooks/{id}/deliveries")
+def webhook_deliveries_api(id: str, limit: int = Query(20, ge=1, le=200), business_id: str = Query(...)):
+    existing = [w for w in db.get_webhooks(business_id) if str(w.get("id")) == str(id)]
+    if not existing:
+        return _error("Webhook not found", 404)
+    return _success(db.get_webhook_deliveries(id, limit=limit))
+
+
+@app.post("/api/webhooks/{id}/test")
+async def webhook_test_api(id: str, business_id: str = Query(...)):
+    from integrations.webhook_dispatcher import dispatch_event
+
+    existing = [w for w in db.get_webhooks(business_id) if str(w.get("id")) == str(id)]
+    if not existing:
+        return _error("Webhook not found", 404)
+    await dispatch_event(
+        business_id=business_id,
+        event_type="webhook.test",
+        payload={"message": "RapidXAI webhook test", "webhook_id": id},
+    )
+    return _success({"sent": True})
 
 
 @app.websocket("/ws/live")
@@ -2644,6 +3426,16 @@ async def whatsapp_webhook(request: Request):
         row = db.add_to_dnc(business_id, phone, "whatsapp_stop", "whatsapp_webhook")
         if row:
             logging.info("[WHATSAPP] STOP received and added to DNC phone=%s business_id=%s", phone, business_id)
+            try:
+                from integrations.webhook_dispatcher import dispatch_event
+
+                await dispatch_event(
+                    business_id,
+                    "dnc.added",
+                    {"phone": phone, "reason": "whatsapp_stop", "added_by": "whatsapp_webhook"},
+                )
+            except Exception:
+                pass
             return _success({"dnc_added": True, "phone": phone})
     try:
         from surveys.survey_engine import handle_incoming_survey_response

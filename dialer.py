@@ -20,6 +20,20 @@ async def start_campaign(campaign_id: str):
     task = asyncio.create_task(_run_campaign(campaign_id))
     _active_dialers[campaign_id] = task
     logging.info(f"[DIALER] Campaign {campaign_id} started")
+    try:
+        campaign = db.get_campaign(campaign_id) or {}
+        if campaign.get("business_id"):
+            from integrations.webhook_dispatcher import dispatch_event
+
+            asyncio.create_task(
+                dispatch_event(
+                    str(campaign.get("business_id")),
+                    "campaign.started",
+                    {"campaign_id": campaign_id, "name": campaign.get("name")},
+                )
+            )
+    except Exception:
+        pass
 
 
 async def stop_campaign(campaign_id: str):
@@ -67,9 +81,25 @@ async def _run_campaign(campaign_id: str):
                             calls_made_before_pause=calls_made,
                         )
                         logging.info("[BUDGET] Campaign %s hit budget cap of $%s. Paused.", campaign_id, cap)
+                        db.create_notification(
+                            business_id=str(campaign.get("business_id")),
+                            type="budget_alert",
+                            title="Campaign Paused (Budget Cap)",
+                            body=f"Campaign {campaign.get('name') or campaign_id} hit budget cap ${cap}",
+                            resource_type="campaign",
+                            resource_id=str(campaign_id),
+                        )
                         break
                     if spend >= cap * 0.9:
                         logging.warning("[BUDGET] Campaign %s at 90%% of budget cap.", campaign_id)
+                        db.create_notification(
+                            business_id=str(campaign.get("business_id")),
+                            type="budget_alert",
+                            title="Campaign Near Budget Cap",
+                            body=f"Campaign {campaign.get('name') or campaign_id} has reached 90% of budget.",
+                            resource_type="campaign",
+                            resource_id=str(campaign_id),
+                        )
 
             now_utc = datetime.utcnow()
             if best_hours_refreshed_at is None or (now_utc - best_hours_refreshed_at) >= timedelta(minutes=30):
@@ -133,6 +163,26 @@ async def _run_campaign(campaign_id: str):
                 if not requeued:
                     db.update_campaign(campaign_id, status="completed", completed_at=datetime.utcnow().isoformat())
                     logging.info(f"[DIALER] Campaign {campaign_id} completed")
+                    db.create_notification(
+                        business_id=str(campaign.get("business_id")),
+                        type="campaign_complete",
+                        title="Campaign Completed",
+                        body=f"Campaign {campaign.get('name') or campaign_id} has completed.",
+                        resource_type="campaign",
+                        resource_id=str(campaign_id),
+                    )
+                    try:
+                        from integrations.webhook_dispatcher import dispatch_event
+
+                        asyncio.create_task(
+                            dispatch_event(
+                                str(campaign.get("business_id")),
+                                "campaign.completed",
+                                {"campaign_id": campaign_id, "name": campaign.get("name")},
+                            )
+                        )
+                    except Exception:
+                        pass
                     await _advance_sequence_if_needed(campaign_id)
                     break
                 await asyncio.sleep(10)
@@ -154,6 +204,18 @@ async def _run_campaign(campaign_id: str):
             if db.is_dnc(str(campaign["business_id"]), lead["phone"]):
                 db.update_lead_status(str(lead["id"]), "dnc")
                 logging.info("[DNC] Skipping %s - on DNC list", lead["phone"])
+                try:
+                    from integrations.webhook_dispatcher import dispatch_event
+
+                    asyncio.create_task(
+                        dispatch_event(
+                            str(campaign.get("business_id")),
+                            "lead.updated",
+                            {"lead_id": str(lead.get("id")), "status": "dnc", "phone": lead.get("phone")},
+                        )
+                    )
+                except Exception:
+                    pass
                 continue
 
             selected_agent_id = db.pick_variant_agent(campaign_id) or str(campaign["agent_id"])

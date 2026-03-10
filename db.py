@@ -427,6 +427,74 @@ def initdb():
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_business_created
       ON audit_log(business_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS objection_handlers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+      trigger_phrases TEXT[] NOT NULL,
+      response TEXT NOT NULL,
+      priority INT DEFAULT 1,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS pronunciation_guide (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+      word TEXT NOT NULL,
+      pronunciation TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS webhooks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      events TEXT[] NOT NULL,
+      secret TEXT,
+      is_active BOOLEAN DEFAULT true,
+      last_triggered_at TIMESTAMPTZ,
+      failure_count INT DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      webhook_id UUID REFERENCES webhooks(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      response_status INT,
+      response_body TEXT,
+      success BOOLEAN DEFAULT false,
+      attempted_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS scheduled_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      report_type TEXT NOT NULL,
+      frequency TEXT DEFAULT 'daily',
+      send_to TEXT[] NOT NULL,
+      campaign_id UUID,
+      is_active BOOLEAN DEFAULT true,
+      last_sent_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      resource_type TEXT,
+      resource_id UUID,
+      is_read BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_business_read
+      ON notifications(business_id, is_read, created_at DESC);
     """
 
     conn = None
@@ -485,6 +553,10 @@ def initdb():
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS supervisor_mode TEXT")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS detected_language TEXT")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS quality_score INT")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS sms_sent BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS key_points JSONB DEFAULT '[]'::jsonb")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS follow_up_action TEXT")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS inbound_speaks_first BOOLEAN DEFAULT true")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure TEXT DEFAULT NULL")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_disclosure_language TEXT DEFAULT 'hi-IN'")
@@ -499,6 +571,35 @@ def initdb():
             cur.execute(
                 "ALTER TABLE agents ADD COLUMN IF NOT EXISTS supported_languages TEXT[] DEFAULT ARRAY['hi-IN', 'en-IN', 'ta-IN', 'te-IN', 'kn-IN', 'mr-IN']::text[]"
             )
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_provider TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_fallback_model TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN DEFAULT true")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_lookback_calls INT DEFAULT 3")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS persona TEXT DEFAULT 'professional'")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_followup_enabled BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_interested TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_template_booked TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS email_followup_enabled BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score INT DEFAULT 50")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_factors JSONB DEFAULT '{}'::jsonb")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS score_updated_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS temperature TEXT DEFAULT 'warm'")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT ARRAY[]::text[]")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS country_code TEXT")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS phone_e164 TEXT")
+            cur.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT NULL")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_api_key TEXT")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS hubspot_sync_enabled BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_calendar_id TEXT")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gcal_sync_enabled BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_webhook_url TEXT")
+            cur.execute(
+                "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS slack_notify_on TEXT[] DEFAULT ARRAY['booking', 'campaign_complete', 'budget_alert', 'error']::text[]"
+            )
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_provider TEXT")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_api_key TEXT")
+            cur.execute("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS sms_sender_id TEXT")
+            cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gcal_event_id TEXT")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS turn_count INT DEFAULT 0")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS last_user_utterance TEXT")
             cur.execute("ALTER TABLE active_calls ADD COLUMN IF NOT EXISTS live_sentiment TEXT DEFAULT 'neutral'")
@@ -509,7 +610,7 @@ def initdb():
         raise
     finally:
         if conn is not None:
-            conn.close()
+            release_conn(conn)
 # Businesses
 
 def create_business(name, description=None, website=None, timezone="Asia/Kolkata", whatsapp_instance=None, whatsapp_token=None):
@@ -565,10 +666,56 @@ def get_business(id):
 
 
 def update_business(id, **kwargs):
-    allowed = {"name", "description", "website", "timezone", "whatsapp_instance", "whatsapp_token"}
+    allowed = {
+        "name",
+        "description",
+        "website",
+        "timezone",
+        "whatsapp_instance",
+        "whatsapp_token",
+        "hubspot_api_key",
+        "hubspot_sync_enabled",
+        "gcal_calendar_id",
+        "gcal_sync_enabled",
+        "slack_webhook_url",
+        "slack_notify_on",
+        "sms_provider",
+        "sms_api_key",
+        "sms_sender_id",
+        "reminder_enabled",
+        "reminder_hours_before",
+    }
     set_sql, vals = _update_statement(kwargs, allowed)
     if not set_sql:
         return {}
+
+    if "slack_notify_on" in kwargs and kwargs.get("slack_notify_on") is not None:
+        keys = [k for k in kwargs.keys() if k in allowed and kwargs[k] is not None]
+        vals = []
+        set_parts = []
+        for k in keys:
+            if k == "slack_notify_on":
+                set_parts.append("slack_notify_on=%s::text[]")
+                vals.append(list(kwargs[k] or []))
+            elif k == "reminder_hours_before":
+                set_parts.append("reminder_hours_before=%s::int[]")
+                vals.append([int(x) for x in (kwargs[k] or [])])
+            else:
+                set_parts.append(f"{k}=%s")
+                vals.append(kwargs[k])
+        set_sql = ", ".join(set_parts)
+    elif "reminder_hours_before" in kwargs and kwargs.get("reminder_hours_before") is not None:
+        keys = [k for k in kwargs.keys() if k in allowed and kwargs[k] is not None]
+        vals = []
+        set_parts = []
+        for k in keys:
+            if k == "reminder_hours_before":
+                set_parts.append("reminder_hours_before=%s::int[]")
+                vals.append([int(x) for x in (kwargs[k] or [])])
+            else:
+                set_parts.append(f"{k}=%s")
+                vals.append(kwargs[k])
+        set_sql = ", ".join(set_parts)
 
     conn = None
     try:
@@ -795,6 +942,15 @@ def create_agent(**kwargs):
         "dtmf_menu": None,
         "auto_detect_language": False,
         "supported_languages": ["hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN", "mr-IN"],
+        "llm_fallback_provider": None,
+        "llm_fallback_model": None,
+        "memory_enabled": True,
+        "memory_lookback_calls": 3,
+        "persona": "professional",
+        "sms_followup_enabled": False,
+        "sms_template_interested": None,
+        "sms_template_booked": None,
+        "email_followup_enabled": False,
         "is_active": False,
     }
     defaults.update({k: v for k, v in kwargs.items() if v is not None})
@@ -813,14 +969,20 @@ def create_agent(**kwargs):
                  max_turns, silence_threshold_seconds, max_nudges, inbound_speaks_first,
                  consent_disclosure, consent_disclosure_language,
                  voicemail_message, handoff_enabled, handoff_sip_address, handoff_trigger_phrases,
-                 dtmf_menu, auto_detect_language, supported_languages, is_active)
+                 dtmf_menu, auto_detect_language, supported_languages,
+                 llm_fallback_provider, llm_fallback_model, memory_enabled, memory_lookback_calls,
+                 persona, sms_followup_enabled, sms_template_interested, sms_template_booked,
+                 email_followup_enabled, is_active)
                 VALUES
                 (%s::uuid, %s, %s, %s, %s, %s,
                  %s, %s, %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s, %s, %s, %s,
-                 %s, %s, %s, %s::text[], %s::jsonb, %s, %s::text[], %s)
+                 %s, %s, %s, %s::text[], %s::jsonb, %s, %s::text[],
+                 %s, %s, %s, %s,
+                 %s, %s, %s, %s,
+                 %s, %s)
                 RETURNING *
                 """,
                 (
@@ -854,6 +1016,15 @@ def create_agent(**kwargs):
                     json.dumps(defaults["dtmf_menu"]) if defaults.get("dtmf_menu") is not None else None,
                     defaults["auto_detect_language"],
                     list(defaults["supported_languages"] or []),
+                    defaults["llm_fallback_provider"],
+                    defaults["llm_fallback_model"],
+                    defaults["memory_enabled"],
+                    defaults["memory_lookback_calls"],
+                    defaults["persona"],
+                    defaults["sms_followup_enabled"],
+                    defaults["sms_template_interested"],
+                    defaults["sms_template_booked"],
+                    defaults["email_followup_enabled"],
                     defaults["is_active"],
                 ),
             )
@@ -930,6 +1101,9 @@ def update_agent(id, **kwargs):
         "inbound_speaks_first", "consent_disclosure", "consent_disclosure_language",
         "voicemail_message", "handoff_enabled", "handoff_sip_address", "handoff_trigger_phrases",
         "dtmf_menu", "auto_detect_language", "supported_languages",
+        "llm_fallback_provider", "llm_fallback_model", "memory_enabled", "memory_lookback_calls",
+        "persona", "sms_followup_enabled", "sms_template_interested", "sms_template_booked",
+        "email_followup_enabled",
     }
     set_sql, vals = _update_statement(kwargs, allowed)
     if not set_sql:
@@ -1791,6 +1965,14 @@ def create_lead(**kwargs):
         "next_call_at": None,
         "scheduled_script_id": None,
         "notes": None,
+        "score": 50,
+        "score_factors": {},
+        "score_updated_at": None,
+        "temperature": "warm",
+        "tags": [],
+        "country_code": None,
+        "phone_e164": None,
+        "email_verified": None,
     }
     defaults.update({k: v for k, v in kwargs.items() if v is not None})
     phone = _clean_phone(defaults["phone"])
@@ -1806,10 +1988,12 @@ def create_lead(**kwargs):
                 """
                 INSERT INTO leads
                 (campaign_id, business_id, phone, name, email, language, custom_data, status,
-                 call_attempts, max_call_attempts, last_call_at, next_call_at, scheduled_script_id, notes)
+                 call_attempts, max_call_attempts, last_call_at, next_call_at, scheduled_script_id, notes,
+                 score, score_factors, score_updated_at, temperature, tags, country_code, phone_e164, email_verified)
                 VALUES
                 (%s::uuid, %s::uuid, %s, %s, %s, %s, %s::jsonb, %s,
-                 %s, %s, %s, %s, %s::uuid, %s)
+                 %s, %s, %s, %s, %s::uuid, %s,
+                 %s, %s::jsonb, %s, %s, %s::text[], %s, %s, %s)
                 RETURNING *
                 """,
                 (
@@ -1819,6 +2003,10 @@ def create_lead(**kwargs):
                     defaults["call_attempts"], defaults["max_call_attempts"],
                     defaults["last_call_at"], defaults["next_call_at"],
                     defaults["scheduled_script_id"], defaults["notes"],
+                    defaults["score"], json.dumps(defaults["score_factors"] or {}),
+                    defaults["score_updated_at"], defaults["temperature"],
+                    list(defaults["tags"] or []), defaults["country_code"],
+                    defaults["phone_e164"], defaults["email_verified"],
                 ),
             )
             return _dict(cur.fetchone())
@@ -1862,6 +2050,14 @@ def bulk_create_leads(campaign_id, business_id, leads):
             "next_call_at": lead.get("next_call_at"),
             "scheduled_script_id": lead.get("scheduled_script_id"),
             "notes": lead.get("notes"),
+            "score": int(lead.get("score") or 50),
+            "score_factors": lead.get("score_factors") or {},
+            "score_updated_at": lead.get("score_updated_at"),
+            "temperature": lead.get("temperature") or "warm",
+            "tags": list(lead.get("tags") or []),
+            "country_code": lead.get("country_code"),
+            "phone_e164": lead.get("phone_e164"),
+            "email_verified": lead.get("email_verified"),
         }
 
     rows = list(deduped.values())
@@ -1887,6 +2083,8 @@ def bulk_create_leads(campaign_id, business_id, leads):
                     r["campaign_id"], r["business_id"], r["phone"], r["name"], r["email"], r["language"],
                     json.dumps(r["custom_data"]), r["status"], r["call_attempts"], r["max_call_attempts"],
                     r["last_call_at"], r["next_call_at"], r["scheduled_script_id"], r["notes"],
+                    r["score"], json.dumps(r["score_factors"]), r["score_updated_at"], r["temperature"],
+                    list(r["tags"]), r["country_code"], r["phone_e164"], r["email_verified"],
                 )
                 for r in to_insert
             ]
@@ -1897,11 +2095,13 @@ def bulk_create_leads(campaign_id, business_id, leads):
                 INSERT INTO leads
                 (campaign_id, business_id, phone, name, email, language,
                  custom_data, status, call_attempts, max_call_attempts,
-                 last_call_at, next_call_at, scheduled_script_id, notes)
+                 last_call_at, next_call_at, scheduled_script_id, notes,
+                 score, score_factors, score_updated_at, temperature, tags,
+                 country_code, phone_e164, email_verified)
                 VALUES %s
                 """,
                 values,
-                template="(%s::uuid,%s::uuid,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::uuid,%s)",
+                template="(%s::uuid,%s::uuid,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::uuid,%s,%s,%s::jsonb,%s,%s,%s::text[],%s,%s,%s)",
             )
             return len(to_insert)
     except Exception as e:
@@ -1965,6 +2165,8 @@ def update_lead(id, **kwargs):
     allowed = {
         "phone", "name", "email", "language", "custom_data", "status", "call_attempts",
         "max_call_attempts", "last_call_at", "next_call_at", "scheduled_script_id", "notes",
+        "score", "score_factors", "score_updated_at", "temperature", "tags",
+        "country_code", "phone_e164", "email_verified",
     }
     update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not update_data:
@@ -1976,6 +2178,12 @@ def update_lead(id, **kwargs):
         if k == "custom_data":
             parts.append("custom_data=%s::jsonb")
             vals.append(json.dumps(v))
+        elif k == "score_factors":
+            parts.append("score_factors=%s::jsonb")
+            vals.append(json.dumps(v or {}))
+        elif k == "tags":
+            parts.append("tags=%s::text[]")
+            vals.append(list(v or []))
         elif k == "scheduled_script_id":
             parts.append("scheduled_script_id=%s::uuid")
             vals.append(v)
@@ -2032,7 +2240,7 @@ def get_next_pending_leads(campaign_id, limit=10):
                     WHERE campaign_id = %s::uuid
                       AND status = 'pending'
                       AND (next_call_at IS NULL OR next_call_at <= NOW())
-                    ORDER BY created_at ASC
+                    ORDER BY score DESC NULLS LAST, created_at ASC
                     LIMIT %s
                 )
                 UPDATE leads
@@ -2573,7 +2781,7 @@ def get_active_calls(business_id=None):
             release_conn(conn)
 
 
-def update_active_call_turn(room_id, role, content):
+def update_active_call_turn(room_id, role, content, live_sentiment=None):
     conn = None
     try:
         conn = get_conn()
@@ -2584,10 +2792,11 @@ def update_active_call_turn(room_id, role, content):
                     UPDATE active_calls
                     SET turn_count = COALESCE(turn_count, 0) + 1,
                         last_user_utterance = %s,
+                        live_sentiment = COALESCE(%s, live_sentiment),
                         last_updated = NOW()
                     WHERE room_id = %s
                     """,
-                    ((content or "")[:200], room_id),
+                    ((content or "")[:200], live_sentiment, room_id),
                 )
             else:
                 cur.execute(
@@ -4110,6 +4319,24 @@ def update_booking(id, status=None, notes=None, start_time=None):
             release_conn(conn)
 
 
+def update_booking_gcal_event(id, gcal_event_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bookings SET gcal_event_id=%s WHERE id=%s::uuid RETURNING *",
+                (gcal_event_id, id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("update_booking_gcal_event failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
 def get_bookings_summary(business_id):
     default = {
         "today": 0,
@@ -4695,6 +4922,1310 @@ def get_quality_distribution(campaign_id):
     except Exception as e:
         logger.exception("get_quality_distribution failed: %s", e)
         return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Lead scoring / tags / timeline
+
+def get_leads_by_temperature(campaign_id, temperature):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM leads
+                WHERE campaign_id=%s::uuid AND temperature=%s
+                ORDER BY score DESC NULLS LAST, created_at ASC
+                """,
+                (campaign_id, str(temperature or "").lower()),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_leads_by_temperature failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_score_distribution(campaign_id):
+    default = {"hot": 0, "warm": 0, "cold": 0, "avg_score": 0.0}
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE temperature='hot')::int AS hot,
+                  COUNT(*) FILTER (WHERE temperature='warm')::int AS warm,
+                  COUNT(*) FILTER (WHERE temperature='cold')::int AS cold,
+                  ROUND(COALESCE(AVG(score), 0)::numeric, 2) AS avg_score
+                FROM leads
+                WHERE campaign_id=%s::uuid
+                """,
+                (campaign_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            return {
+                "hot": int(row.get("hot") or 0),
+                "warm": int(row.get("warm") or 0),
+                "cold": int(row.get("cold") or 0),
+                "avg_score": float(row.get("avg_score") or 0.0),
+            }
+    except Exception as e:
+        logger.exception("get_score_distribution failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def add_lead_tag(lead_id, tag: str):
+    conn = None
+    try:
+        clean_tag = str(tag or "").strip()
+        if not clean_tag:
+            return False
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET tags = CASE
+                    WHEN tags IS NULL THEN ARRAY[%s]::text[]
+                    WHEN NOT (%s = ANY(tags)) THEN array_append(tags, %s)
+                    ELSE tags
+                END
+                WHERE id=%s::uuid
+                """,
+                (clean_tag, clean_tag, clean_tag, lead_id),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("add_lead_tag failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def remove_lead_tag(lead_id, tag: str):
+    conn = None
+    try:
+        clean_tag = str(tag or "").strip()
+        if not clean_tag:
+            return False
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET tags = array_remove(COALESCE(tags, ARRAY[]::text[]), %s)
+                WHERE id=%s::uuid
+                """,
+                (clean_tag, lead_id),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("remove_lead_tag failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_leads_by_tag(campaign_id, tag: str):
+    conn = None
+    try:
+        clean_tag = str(tag or "").strip()
+        if not clean_tag:
+            return []
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM leads
+                WHERE campaign_id=%s::uuid AND %s = ANY(COALESCE(tags, ARRAY[]::text[]))
+                ORDER BY score DESC NULLS LAST, created_at ASC
+                """,
+                (campaign_id, clean_tag),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_leads_by_tag failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_all_tags(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT unnest(COALESCE(tags, ARRAY[]::text[])) AS tag
+                FROM leads
+                WHERE business_id=%s::uuid
+                ORDER BY tag
+                """,
+                (business_id,),
+            )
+            return [str(r.get("tag")) for r in cur.fetchall() if r.get("tag")]
+    except Exception as e:
+        logger.exception("get_all_tags failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_lead_timeline(lead_id):
+    conn = None
+    try:
+        conn = get_conn()
+        events = []
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, room_id, status, disposition, duration_seconds, summary, sentiment, created_at
+                FROM calls
+                WHERE lead_id=%s::uuid
+                ORDER BY created_at ASC
+                """,
+                (lead_id,),
+            )
+            calls = _list(cur.fetchall())
+            room_ids = [c.get("room_id") for c in calls if c.get("room_id")]
+
+            for call in calls:
+                events.append(
+                    {
+                        "event_type": "call",
+                        "timestamp": str(call.get("created_at")),
+                        "data": call,
+                    }
+                )
+                events.append(
+                    {
+                        "event_type": "status_change",
+                        "timestamp": str(call.get("created_at")),
+                        "data": {
+                            "status": call.get("status"),
+                            "disposition": call.get("disposition"),
+                            "call_id": str(call.get("id")),
+                            "room_id": call.get("room_id"),
+                        },
+                    }
+                )
+
+            if room_ids:
+                cur.execute(
+                    """
+                    SELECT room_id, role, content, turn_number, created_at
+                    FROM call_transcript_lines
+                    WHERE room_id = ANY(%s)
+                    ORDER BY created_at ASC
+                    """,
+                    (room_ids,),
+                )
+                for row in _list(cur.fetchall()):
+                    events.append(
+                        {
+                            "event_type": "transcript",
+                            "timestamp": str(row.get("created_at")),
+                            "data": row,
+                        }
+                    )
+
+            cur.execute(
+                """
+                SELECT b.*, c.room_id
+                FROM bookings b
+                JOIN calls c ON c.id = b.call_id
+                WHERE c.lead_id=%s::uuid
+                ORDER BY b.created_at ASC
+                """,
+                (lead_id,),
+            )
+            for row in _list(cur.fetchall()):
+                events.append(
+                    {
+                        "event_type": "booking",
+                        "timestamp": str(row.get("created_at")),
+                        "data": row,
+                    }
+                )
+
+            cur.execute(
+                """
+                SELECT *
+                FROM scheduled_callbacks
+                WHERE lead_id=%s::uuid
+                ORDER BY created_at ASC
+                """,
+                (lead_id,),
+            )
+            for row in _list(cur.fetchall()):
+                events.append(
+                    {
+                        "event_type": "callback",
+                        "timestamp": str(row.get("created_at")),
+                        "data": row,
+                    }
+                )
+
+        events.sort(key=lambda x: str(x.get("timestamp") or ""))
+        return events
+    except Exception as e:
+        logger.exception("get_lead_timeline failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def find_duplicate_leads_across_campaigns(business_id, phones):
+    conn = None
+    try:
+        clean_phones = []
+        seen = set()
+        for p in phones or []:
+            cp = _clean_phone(str(p))
+            if cp and cp not in seen:
+                clean_phones.append(cp)
+                seen.add(cp)
+        if not clean_phones:
+            return {}
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT phone, campaign_id
+                FROM leads
+                WHERE business_id=%s::uuid
+                  AND phone = ANY(%s)
+                """,
+                (business_id, clean_phones),
+            )
+            out = {}
+            for row in _list(cur.fetchall()):
+                phone = str(row.get("phone") or "")
+                campaign_id = str(row.get("campaign_id") or "")
+                if not phone or not campaign_id:
+                    continue
+                out.setdefault(phone, [])
+                if campaign_id not in out[phone]:
+                    out[phone].append(campaign_id)
+            return out
+    except Exception as e:
+        logger.exception("find_duplicate_leads_across_campaigns failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_lead_across_campaigns(business_id, phone):
+    conn = None
+    try:
+        clean = _clean_phone(phone)
+        if not clean:
+            return []
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT l.*, c.name AS campaign_name
+                FROM leads l
+                LEFT JOIN campaigns c ON c.id = l.campaign_id
+                WHERE l.business_id=%s::uuid
+                  AND l.phone=%s
+                ORDER BY l.created_at DESC
+                """,
+                (business_id, clean),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_lead_across_campaigns failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Objection handlers / pronunciation guide
+
+def create_objection_handler(agent_id, trigger_phrases, response, priority=1):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO objection_handlers (agent_id, trigger_phrases, response, priority)
+                VALUES (%s::uuid, %s::text[], %s, %s)
+                RETURNING *
+                """,
+                (agent_id, list(trigger_phrases or []), response, int(priority or 1)),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_objection_handler failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_objection_handlers(agent_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM objection_handlers
+                WHERE agent_id=%s::uuid AND is_active=true
+                ORDER BY priority DESC, created_at ASC
+                """,
+                (agent_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_objection_handlers failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def update_objection_handler(id, **kwargs):
+    allowed = {"trigger_phrases", "response", "priority", "is_active"}
+    update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    if not update_data:
+        return {}
+
+    parts = []
+    vals = []
+    for k, v in update_data.items():
+        if k == "trigger_phrases":
+            parts.append("trigger_phrases=%s::text[]")
+            vals.append(list(v or []))
+        else:
+            parts.append(f"{k}=%s")
+            vals.append(v)
+
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE objection_handlers SET {', '.join(parts)} WHERE id=%s::uuid RETURNING *",
+                vals + [id],
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("update_objection_handler failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_objection_handler(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM objection_handlers WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_objection_handler failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_pronunciation_entry(agent_id, word, pronunciation):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pronunciation_guide (agent_id, word, pronunciation)
+                VALUES (%s::uuid, %s, %s)
+                RETURNING *
+                """,
+                (agent_id, word, pronunciation),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_pronunciation_entry failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_pronunciation_guide(agent_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM pronunciation_guide WHERE agent_id=%s::uuid ORDER BY created_at ASC",
+                (agent_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_pronunciation_guide failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_pronunciation_entry(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM pronunciation_guide WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_pronunciation_entry failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Advanced analytics
+
+def get_call_heatmap(business_id, days=30):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  ((EXTRACT(DOW FROM created_at AT TIME ZONE 'Asia/Kolkata') + 6)::int % 7) AS day_of_week,
+                  EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour,
+                  COUNT(*)::int AS total_calls,
+                  COUNT(*) FILTER (WHERE status='completed')::int AS connected,
+                  ROUND(
+                    COUNT(*) FILTER (WHERE status='completed')::numeric /
+                    NULLIF(COUNT(*), 0) * 100, 1
+                  ) AS connection_rate
+                FROM calls
+                WHERE business_id=%s::uuid
+                  AND created_at >= NOW() - (%s || ' days')::interval
+                GROUP BY 1, 2
+                HAVING COUNT(*) >= 3
+                ORDER BY connection_rate DESC
+                """,
+                (business_id, int(days or 30)),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_call_heatmap failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_agent_comparison(business_id, campaign_id=None, days=7):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            if campaign_id:
+                cur.execute(
+                    """
+                    SELECT
+                      c.agent_id,
+                      COALESCE(a.name, 'Unknown') AS agent_name,
+                      COUNT(*)::int AS total_calls,
+                      COALESCE(AVG(c.duration_seconds), 0)::int AS avg_duration_seconds,
+                      COUNT(*) FILTER (WHERE c.was_booked=true)::int AS booked_count,
+                      ROUND(COALESCE(AVG(c.quality_score), 0)::numeric, 2) AS avg_quality_score,
+                      ROUND(COALESCE(AVG(c.interrupt_count), 0)::numeric, 2) AS avg_interrupts,
+                      ROUND(
+                        CASE WHEN COUNT(*) = 0 THEN 0
+                             ELSE (COUNT(*) FILTER (WHERE c.was_booked=true)::numeric / COUNT(*)::numeric) * 100
+                        END, 2
+                      ) AS conversion_rate_pct,
+                      ROUND(
+                        CASE WHEN COUNT(*) = 0 THEN 0
+                             ELSE (COUNT(*) FILTER (WHERE c.sentiment='positive')::numeric / COUNT(*)::numeric) * 100
+                        END, 2
+                      ) AS positive_sentiment_pct
+                    FROM calls c
+                    LEFT JOIN agents a ON a.id = c.agent_id
+                    WHERE c.business_id=%s::uuid
+                      AND c.campaign_id=%s::uuid
+                      AND c.created_at >= NOW() - (%s || ' days')::interval
+                    GROUP BY c.agent_id, a.name
+                    ORDER BY conversion_rate_pct DESC, total_calls DESC
+                    """,
+                    (business_id, campaign_id, int(days or 7)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                      c.agent_id,
+                      COALESCE(a.name, 'Unknown') AS agent_name,
+                      COUNT(*)::int AS total_calls,
+                      COALESCE(AVG(c.duration_seconds), 0)::int AS avg_duration_seconds,
+                      COUNT(*) FILTER (WHERE c.was_booked=true)::int AS booked_count,
+                      ROUND(COALESCE(AVG(c.quality_score), 0)::numeric, 2) AS avg_quality_score,
+                      ROUND(COALESCE(AVG(c.interrupt_count), 0)::numeric, 2) AS avg_interrupts,
+                      ROUND(
+                        CASE WHEN COUNT(*) = 0 THEN 0
+                             ELSE (COUNT(*) FILTER (WHERE c.was_booked=true)::numeric / COUNT(*)::numeric) * 100
+                        END, 2
+                      ) AS conversion_rate_pct,
+                      ROUND(
+                        CASE WHEN COUNT(*) = 0 THEN 0
+                             ELSE (COUNT(*) FILTER (WHERE c.sentiment='positive')::numeric / COUNT(*)::numeric) * 100
+                        END, 2
+                      ) AS positive_sentiment_pct
+                    FROM calls c
+                    LEFT JOIN agents a ON a.id = c.agent_id
+                    WHERE c.business_id=%s::uuid
+                      AND c.created_at >= NOW() - (%s || ' days')::interval
+                    GROUP BY c.agent_id, a.name
+                    ORDER BY conversion_rate_pct DESC, total_calls DESC
+                    """,
+                    (business_id, int(days or 7)),
+                )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_agent_comparison failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_cost_per_acquisition(business_id, from_date, to_date):
+    default = {
+        "total_cost_usd": 0.0,
+        "total_calls": 0,
+        "total_bookings": 0,
+        "cost_per_call": 0.0,
+        "cost_per_booking": None,
+        "cost_per_interested_lead": None,
+        "by_campaign": [],
+    }
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COALESCE(SUM(estimated_cost_usd), 0)::numeric(12,4) AS total_cost,
+                  COUNT(*)::int AS total_calls,
+                  COUNT(*) FILTER (WHERE was_booked=true)::int AS total_bookings,
+                  COUNT(*) FILTER (WHERE disposition='interested')::int AS interested_count
+                FROM calls
+                WHERE business_id=%s::uuid
+                  AND created_at::date >= %s::date
+                  AND created_at::date <= %s::date
+                """,
+                (business_id, from_date, to_date),
+            )
+            row = _dict(cur.fetchone()) or {}
+            total_cost = float(row.get("total_cost") or 0.0)
+            total_calls = int(row.get("total_calls") or 0)
+            total_bookings = int(row.get("total_bookings") or 0)
+            interested_count = int(row.get("interested_count") or 0)
+
+            cur.execute(
+                """
+                SELECT
+                  c.campaign_id,
+                  COALESCE(cp.name, 'Unknown') AS campaign_name,
+                  COALESCE(SUM(c.estimated_cost_usd), 0)::numeric(12,4) AS cost,
+                  COUNT(*) FILTER (WHERE c.was_booked=true)::int AS bookings
+                FROM calls c
+                LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+                WHERE c.business_id=%s::uuid
+                  AND c.created_at::date >= %s::date
+                  AND c.created_at::date <= %s::date
+                GROUP BY c.campaign_id, cp.name
+                ORDER BY cost DESC
+                """,
+                (business_id, from_date, to_date),
+            )
+            by_campaign = []
+            for r in _list(cur.fetchall()):
+                cost = float(r.get("cost") or 0.0)
+                bookings = int(r.get("bookings") or 0)
+                by_campaign.append(
+                    {
+                        "campaign_id": str(r.get("campaign_id")) if r.get("campaign_id") else None,
+                        "campaign_name": r.get("campaign_name"),
+                        "cost": cost,
+                        "bookings": bookings,
+                        "cpa": (cost / bookings) if bookings > 0 else None,
+                    }
+                )
+
+            return {
+                "total_cost_usd": total_cost,
+                "total_calls": total_calls,
+                "total_bookings": total_bookings,
+                "cost_per_call": (total_cost / total_calls) if total_calls > 0 else 0.0,
+                "cost_per_booking": (total_cost / total_bookings) if total_bookings > 0 else None,
+                "cost_per_interested_lead": (total_cost / interested_count) if interested_count > 0 else None,
+                "by_campaign": by_campaign,
+            }
+    except Exception as e:
+        logger.exception("get_cost_per_acquisition failed: %s", e)
+        return default
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_sentiment_trend(campaign_id, days=7):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  created_at::date AS date,
+                  COUNT(*) FILTER (WHERE sentiment='positive')::int AS positive,
+                  COUNT(*) FILTER (WHERE sentiment='neutral')::int AS neutral,
+                  COUNT(*) FILTER (WHERE sentiment='negative')::int AS negative,
+                  COUNT(*) FILTER (WHERE sentiment IS NULL OR sentiment NOT IN ('positive','neutral','negative'))::int AS unknown
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                  AND created_at >= NOW() - (%s || ' days')::interval
+                GROUP BY 1
+                ORDER BY 1 ASC
+                """,
+                (campaign_id, int(days or 7)),
+            )
+            out = []
+            for row in _list(cur.fetchall()):
+                out.append(
+                    {
+                        "date": str(row.get("date")),
+                        "positive": int(row.get("positive") or 0),
+                        "neutral": int(row.get("neutral") or 0),
+                        "negative": int(row.get("negative") or 0),
+                        "unknown": int(row.get("unknown") or 0),
+                    }
+                )
+            return out
+    except Exception as e:
+        logger.exception("get_sentiment_trend failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_scheduled_report(business_id, report_type, frequency, send_to, campaign_id=None):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scheduled_reports (business_id, report_type, frequency, send_to, campaign_id)
+                VALUES (%s::uuid, %s, %s, %s::text[], %s::uuid)
+                RETURNING *
+                """,
+                (business_id, report_type, frequency, list(send_to or []), campaign_id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_scheduled_report failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_scheduled_reports(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM scheduled_reports
+                WHERE business_id=%s::uuid
+                ORDER BY created_at DESC
+                """,
+                (business_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_scheduled_reports failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def update_report_last_sent(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE scheduled_reports SET last_sent_at=NOW() WHERE id=%s::uuid",
+                (id,),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("update_report_last_sent failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_scheduled_report(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM scheduled_reports WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_scheduled_report failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Integrations: webhooks
+
+def create_webhook(business_id, name, url, events, secret=None):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO webhooks (business_id, name, url, events, secret)
+                VALUES (%s::uuid, %s, %s, %s::text[], %s)
+                RETURNING *
+                """,
+                (business_id, name, url, list(events or []), secret),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_webhook failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_webhooks(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM webhooks WHERE business_id=%s::uuid ORDER BY created_at DESC",
+                (business_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_webhooks failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def update_webhook(id, **kwargs):
+    allowed = {"name", "url", "events", "secret", "is_active", "failure_count", "last_triggered_at"}
+    update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    if not update_data:
+        return {}
+
+    parts = []
+    vals = []
+    for k, v in update_data.items():
+        if k == "events":
+            parts.append("events=%s::text[]")
+            vals.append(list(v or []))
+        else:
+            parts.append(f"{k}=%s")
+            vals.append(v)
+
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(f"UPDATE webhooks SET {', '.join(parts)} WHERE id=%s::uuid RETURNING *", vals + [id])
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("update_webhook failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_webhook(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM webhooks WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_webhook failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_webhook_deliveries(webhook_id, limit=20):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM webhook_deliveries
+                WHERE webhook_id=%s::uuid
+                ORDER BY attempted_at DESC
+                LIMIT %s
+                """,
+                (webhook_id, limit),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_webhook_deliveries failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def log_webhook_delivery(webhook_id, event_type, payload, response_status=None, response_body=None, success=False):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO webhook_deliveries
+                (webhook_id, event_type, payload, response_status, response_body, success)
+                VALUES (%s::uuid, %s, %s::jsonb, %s, %s, %s)
+                RETURNING *
+                """,
+                (webhook_id, event_type, json.dumps(payload or {}), response_status, response_body, bool(success)),
+            )
+            inserted = _dict(cur.fetchone()) or {}
+            cur.execute(
+                """
+                UPDATE webhooks
+                SET last_triggered_at=NOW(),
+                    failure_count=CASE WHEN %s THEN 0 ELSE COALESCE(failure_count,0)+1 END
+                WHERE id=%s::uuid
+                """,
+                (bool(success), webhook_id),
+            )
+            return inserted
+    except Exception as e:
+        logger.exception("log_webhook_delivery failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+# Notifications / search / activity / bulk actions
+
+def create_notification(business_id, type, title, body, resource_type=None, resource_id=None):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO notifications
+                (business_id, type, title, body, resource_type, resource_id)
+                VALUES (%s::uuid, %s, %s, %s, %s, %s::uuid)
+                RETURNING *
+                """,
+                (business_id, type, title, body, resource_type, resource_id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_notification failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_notifications(business_id, unread_only=False, limit=50):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            if unread_only:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM notifications
+                    WHERE business_id=%s::uuid AND is_read=false
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (business_id, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM notifications
+                    WHERE business_id=%s::uuid
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (business_id, limit),
+                )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_notifications failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def mark_notification_read(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE notifications SET is_read=true WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("mark_notification_read failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def mark_all_read(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE notifications SET is_read=true WHERE business_id=%s::uuid AND is_read=false",
+                (business_id,),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("mark_all_read failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_unread_count(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*)::int AS c FROM notifications WHERE business_id=%s::uuid AND is_read=false",
+                (business_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            return int(row.get("c") or 0)
+    except Exception as e:
+        logger.exception("get_unread_count failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_activity_feed(business_id, limit=50, offset=0):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM (
+                    SELECT 'call' AS type, c.id::text AS id, c.phone AS label,
+                           c.status AS action, c.created_at, c.room_id AS ref_id
+                    FROM calls c
+                    WHERE c.business_id=%s::uuid
+
+                    UNION ALL
+
+                    SELECT 'booking' AS type, b.id::text AS id, b.caller_phone AS label,
+                           'booked' AS action, b.created_at, b.call_id::text AS ref_id
+                    FROM bookings b
+                    WHERE b.business_id=%s::uuid
+
+                    UNION ALL
+
+                    SELECT 'campaign' AS type, cp.id::text AS id, cp.name AS label,
+                           cp.status AS action, cp.created_at, cp.id::text AS ref_id
+                    FROM campaigns cp
+                    WHERE cp.business_id=%s::uuid
+                      AND cp.status IN ('active','completed','paused','failed','pending_approval')
+
+                    UNION ALL
+
+                    SELECT 'notification' AS type, n.id::text AS id, n.title AS label,
+                           n.type AS action, n.created_at, n.resource_id::text AS ref_id
+                    FROM notifications n
+                    WHERE n.business_id=%s::uuid
+                ) feed
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (business_id, business_id, business_id, business_id, limit, offset),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_activity_feed failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def global_search(business_id, query, limit=20):
+    conn = None
+    try:
+        q = str(query or "").strip()
+        if not q:
+            return []
+        like = f"%{q}%"
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM (
+                    SELECT 'lead' AS type, l.id::text AS id,
+                           COALESCE(l.name, l.phone) AS label,
+                           l.phone AS subtitle,
+                           ('/leads/' || l.id::text) AS url
+                    FROM leads l
+                    WHERE l.business_id=%s::uuid
+                      AND (l.phone ILIKE %s OR COALESCE(l.name,'') ILIKE %s)
+                    LIMIT 5
+                ) a
+
+                UNION ALL
+
+                SELECT *
+                FROM (
+                    SELECT 'call' AS type, c.id::text AS id,
+                           c.phone AS label,
+                           COALESCE(c.summary, c.status) AS subtitle,
+                           ('/calls/' || COALESCE(c.room_id, c.id::text)) AS url
+                    FROM calls c
+                    WHERE c.business_id=%s::uuid
+                      AND (c.phone ILIKE %s OR COALESCE(c.transcript,'') ILIKE %s)
+                    LIMIT 5
+                ) b
+
+                UNION ALL
+
+                SELECT *
+                FROM (
+                    SELECT 'campaign' AS type, cp.id::text AS id,
+                           cp.name AS label,
+                           COALESCE(cp.description, cp.status) AS subtitle,
+                           ('/campaigns/' || cp.id::text) AS url
+                    FROM campaigns cp
+                    WHERE cp.business_id=%s::uuid
+                      AND cp.name ILIKE %s
+                    LIMIT 5
+                ) c
+
+                UNION ALL
+
+                SELECT *
+                FROM (
+                    SELECT 'agent' AS type, ag.id::text AS id,
+                           ag.name AS label,
+                           COALESCE(ag.subtitle, ag.llm_model) AS subtitle,
+                           ('/agents/' || ag.id::text) AS url
+                    FROM agents ag
+                    WHERE ag.business_id=%s::uuid
+                      AND ag.name ILIKE %s
+                    LIMIT 5
+                ) d
+
+                LIMIT %s
+                """,
+                (business_id, like, like, business_id, like, like, business_id, like, business_id, like, int(limit or 20)),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("global_search failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_update_lead_status(lead_ids, status):
+    conn = None
+    try:
+        if not lead_ids:
+            return 0
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE leads SET status=%s WHERE id = ANY(%s::uuid[])",
+                (status, list(lead_ids)),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("bulk_update_lead_status failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_add_lead_tags(lead_ids, tag):
+    conn = None
+    try:
+        if not lead_ids or not str(tag or "").strip():
+            return 0
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET tags = CASE
+                    WHEN tags IS NULL THEN ARRAY[%s]::text[]
+                    WHEN NOT (%s = ANY(tags)) THEN array_append(tags, %s)
+                    ELSE tags
+                END
+                WHERE id = ANY(%s::uuid[])
+                """,
+                (tag, tag, tag, list(lead_ids)),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("bulk_add_lead_tags failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_delete_leads(lead_ids):
+    conn = None
+    try:
+        if not lead_ids:
+            return 0
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM leads
+                WHERE id = ANY(%s::uuid[])
+                  AND COALESCE(status, 'pending') = 'pending'
+                """,
+                (list(lead_ids),),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("bulk_delete_leads failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_pause_campaigns(campaign_ids):
+    conn = None
+    try:
+        if not campaign_ids:
+            return 0
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET status='paused',
+                    paused_at=NOW(),
+                    pause_reason=COALESCE(pause_reason, 'bulk_pause')
+                WHERE id = ANY(%s::uuid[])
+                """,
+                (list(campaign_ids),),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("bulk_pause_campaigns failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def bulk_resume_campaigns(campaign_ids):
+    conn = None
+    try:
+        if not campaign_ids:
+            return 0
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET status='active',
+                    paused_at=NULL,
+                    pause_reason=NULL
+                WHERE id = ANY(%s::uuid[])
+                """,
+                (list(campaign_ids),),
+            )
+            return int(cur.rowcount or 0)
+    except Exception as e:
+        logger.exception("bulk_resume_campaigns failed: %s", e)
+        return 0
     finally:
         if conn is not None:
             release_conn(conn)

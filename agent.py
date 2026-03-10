@@ -35,6 +35,12 @@ except Exception as e:
 FILLERS_THINKING = ["Umm...", "Let me see...", "Acha..."]
 FILLERS_AGREEMENT = ["Haan ji,", "Bilkul,", "Theek hai,"]
 FILLERS_EMPATHY = ["Samajh sakta hoon,", "Haan, woh toh hai,"]
+PERSONA_INSTRUCTIONS = {
+    "professional": "Maintain a formal, professional tone. Be concise and clear.",
+    "friendly": "Be warm, conversational and friendly. Use casual language.",
+    "assertive": "Be confident and direct. Gently push for commitment.",
+    "empathetic": "Show understanding and empathy. Listen actively and validate feelings.",
+}
 
 
 def build_stt(cfg: dict):
@@ -65,6 +71,132 @@ def build_llm(cfg: dict):
     if cfg.get("llm_base_url"):
         kwargs["base_url"] = cfg["llm_base_url"]
     return lk_openai.LLM(**kwargs)
+
+
+def create_llm_with_fallback(agent_cfg: dict):
+    try:
+        return build_llm(agent_cfg)
+    except Exception as primary_err:
+        fallback_provider = agent_cfg.get("llm_fallback_provider")
+        fallback_model = agent_cfg.get("llm_fallback_model")
+        if not fallback_provider and not fallback_model:
+            raise
+        logging.warning(
+            "[LLM] Primary %s failed. Switching to fallback.",
+            agent_cfg.get("llm_provider", "openai"),
+        )
+        fallback_cfg = dict(agent_cfg)
+        if fallback_provider:
+            fallback_cfg["llm_provider"] = fallback_provider
+        if fallback_model:
+            fallback_cfg["llm_model"] = fallback_model
+        try:
+            return build_llm(fallback_cfg)
+        except Exception:
+            raise primary_err
+
+
+def inject_lead_context(template: str, lead: dict, campaign: dict) -> str:
+    result = str(template or "")
+    lead = lead or {}
+    campaign = campaign or {}
+    result = result.replace("{{lead_name}}", str(lead.get("name") or "the customer"))
+    result = result.replace("{{lead_phone}}", str(lead.get("phone") or ""))
+    result = result.replace("{{lead_language}}", str(lead.get("language") or "hi-IN"))
+    result = result.replace("{{campaign_name}}", str(campaign.get("name") or ""))
+    result = result.replace("{{campaign_objective}}", str(campaign.get("objective") or ""))
+    custom_data = lead.get("custom_data") or {}
+    if isinstance(custom_data, str):
+        try:
+            custom_data = json.loads(custom_data)
+        except Exception:
+            custom_data = {}
+    if isinstance(custom_data, dict):
+        for k, v in custom_data.items():
+            result = result.replace(f"{{{{custom_{k}}}}}", str(v))
+    return result
+
+
+def apply_pronunciation_guide(text: str, guide: list[dict]) -> str:
+    out = str(text or "")
+    for entry in guide or []:
+        word = str(entry.get("word") or "").strip()
+        pronunciation = str(entry.get("pronunciation") or "").strip()
+        if not word or not pronunciation:
+            continue
+        pattern = re.compile(r"\\b" + re.escape(word) + r"\\b", re.IGNORECASE)
+        out = pattern.sub(pronunciation, out)
+    return out
+
+
+def compute_turn_sentiment(text: str) -> str:
+    sample = str(text or "").lower()
+    positive_keywords = [
+        "interested",
+        "yes",
+        "ok",
+        "sure",
+        "good",
+        "great",
+        "proceed",
+        "confirm",
+        "book",
+        "schedule",
+        "happy",
+        "excellent",
+        "haan",
+        "bilkul",
+    ]
+    negative_keywords = [
+        "no",
+        "not",
+        "busy",
+        "later",
+        "stop",
+        "cancel",
+        "remove",
+        "angry",
+        "upset",
+        "disturb",
+        "wrong",
+        "fraud",
+        "scam",
+        "nahi",
+    ]
+    if any(k in sample for k in negative_keywords):
+        return "negative"
+    if any(k in sample for k in positive_keywords):
+        return "positive"
+    return "neutral"
+
+
+async def generate_call_summary(transcript: str, llm_client, model: str) -> dict:
+    payload = {
+        "summary": "",
+        "disposition": "",
+        "sentiment": "neutral",
+        "key_points": [],
+        "follow_up_action": "",
+    }
+    try:
+        prompt = (
+            "Analyze this call transcript and extract structured information as JSON with keys: "
+            "summary, disposition, sentiment, key_points, follow_up_action.\n\nTranscript:\n"
+            + str(transcript or "")[:5000]
+        )
+        resp = await llm_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=220,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            payload.update(parsed)
+    except Exception:
+        return payload
+    return payload
 
 
 def humanize_text(text: str, user_text: str = "") -> str:
@@ -182,8 +314,17 @@ def infer_sentiment(transcript_text: str) -> str:
     return "neutral"
 
 
-async def say_humanized(session: AgentSession, text: str, user_text: str = "", allow_interruptions: bool = True):
-    await session.say(humanize_text(text, user_text), allow_interruptions=allow_interruptions)
+async def say_humanized(
+    session: AgentSession,
+    text: str,
+    user_text: str = "",
+    allow_interruptions: bool = True,
+    pronunciation_guide: list[dict] | None = None,
+):
+    spoken = humanize_text(text, user_text)
+    if pronunciation_guide:
+        spoken = apply_pronunciation_guide(spoken, pronunciation_guide)
+    await session.say(spoken, allow_interruptions=allow_interruptions)
 
 
 def build_system_prompt(agent_cfg: dict, lead: dict = None, campaign: dict = None, script_override: str = None) -> str:
@@ -375,18 +516,29 @@ class CallTools:
             return "Knowledge lookup failed"
 
 
-async def silence_watchdog(session: AgentSession, ctx, activity_state: dict, threshold: int = 20, max_nudges: int = 2):
+async def silence_watchdog(
+    session: AgentSession,
+    ctx,
+    activity_state: dict,
+    threshold: int = 20,
+    max_nudges: int = 2,
+    pronunciation_guide: list[dict] | None = None,
+):
     nudge_count = 0
     while True:
         await asyncio.sleep(5)
         if time.time() - activity_state["last_activity"] > threshold:
             nudge_count += 1
             if nudge_count > max_nudges:
-                await say_humanized(session, "It seems you're not available right now. I'll try again later. Goodbye!")
+                await say_humanized(
+                    session,
+                    "It seems you're not available right now. I'll try again later. Goodbye!",
+                    pronunciation_guide=pronunciation_guide,
+                )
                 await asyncio.sleep(3)
                 await ctx.room.disconnect()
                 return
-            await say_humanized(session, "Are you still there?")
+            await say_humanized(session, "Are you still there?", pronunciation_guide=pronunciation_guide)
             activity_state["last_activity"] = time.time()
             await asyncio.sleep(threshold)
 
@@ -468,8 +620,10 @@ async def entrypoint(ctx: agents.JobContext):
 
         active_stt = build_stt(agent_cfg)
         active_tts = build_tts(agent_cfg)
-        active_llm = build_llm(agent_cfg)
+        active_llm = create_llm_with_fallback(agent_cfg)
         vad = silero.VAD.load()
+        objection_handlers = db.get_objection_handlers(str(agent_cfg.get("id")))
+        pronunciation_guide = db.get_pronunciation_guide(str(agent_cfg.get("id")))
 
         call_record = db.create_call(
             lead_id=lead_id,
@@ -498,6 +652,24 @@ async def entrypoint(ctx: agents.JobContext):
         tools_instance._agent_id = str(agent_cfg["id"])
 
         system_prompt = build_system_prompt(agent_cfg, lead, campaign, script_override)
+        system_prompt = inject_lead_context(system_prompt, lead or {}, campaign or {})
+        persona_key = str(agent_cfg.get("persona") or "professional")
+        persona_suffix = PERSONA_INSTRUCTIONS.get(persona_key, "")
+        if persona_suffix:
+            system_prompt = f"{system_prompt}\n\nPERSONA:\n{persona_suffix}"
+
+        if bool(agent_cfg.get("memory_enabled", True)) and lead_id:
+            lookback = int(agent_cfg.get("memory_lookback_calls") or 3)
+            history = db.get_call_history_for_lead(lead_id)[: max(1, lookback)]
+            if history:
+                memory_lines = []
+                for h in history:
+                    memory_lines.append(
+                        f"- Call on {h.get('created_at')}: Duration {h.get('duration_seconds')}s. "
+                        f"Disposition: {h.get('disposition')}. Summary: {h.get('summary')}. "
+                        f"Sentiment: {h.get('sentiment')}."
+                    )
+                system_prompt = f"{system_prompt}\n\nCUSTOMER HISTORY:\n" + "\n".join(memory_lines)
 
         voice_agent = Agent(
             instructions=system_prompt,
@@ -521,7 +693,13 @@ async def entrypoint(ctx: agents.JobContext):
             if handoff_state["in_progress"]:
                 return
             handoff_state["in_progress"] = True
-            await say_humanized(session, "Of course! Please hold while I transfer you.", user_text=user_text, allow_interruptions=False)
+            await say_humanized(
+                session,
+                "Of course! Please hold while I transfer you.",
+                user_text=user_text,
+                allow_interruptions=False,
+                pronunciation_guide=pronunciation_guide,
+            )
             transferred = False
             if sip_trunk_id and handoff_sip_address:
                 transferred = await initiate_warm_transfer(ctx.room.name, str(sip_trunk_id), handoff_sip_address)
@@ -543,7 +721,8 @@ async def entrypoint(ctx: agents.JobContext):
             activity_state["last_activity"] = time.time()
             activity_state["last_user_text"] = text
             db.append_transcript_line(ctx.room.name, phone, "user", text, turn_counter["n"])
-            db.update_active_call_turn(ctx.room.name, "user", text)
+            live_sentiment = compute_turn_sentiment(text)
+            db.update_active_call_turn(ctx.room.name, "user", text, live_sentiment=live_sentiment)
             lowered = text.lower()
 
             if auto_detect_language and not detected_language_state["value"]:
@@ -565,8 +744,25 @@ async def entrypoint(ctx: agents.JobContext):
                             session,
                             "I'm handling your request directly. Let me help you with that.",
                             user_text=text,
+                            pronunciation_guide=pronunciation_guide,
                         )
                     )
+
+            for handler in objection_handlers:
+                phrases = handler.get("trigger_phrases") or []
+                if isinstance(phrases, str):
+                    phrases = [phrases]
+                matched = any(str(p).lower() in lowered for p in phrases if str(p).strip())
+                if matched:
+                    asyncio.create_task(
+                        say_humanized(
+                            session,
+                            str(handler.get("response") or "I understand your concern. Let me help."),
+                            user_text=text,
+                            pronunciation_guide=pronunciation_guide,
+                        )
+                    )
+                    break
 
         @session.on("agent_speech_committed")
         def _on_agent_speech(ev):
@@ -582,7 +778,7 @@ async def entrypoint(ctx: agents.JobContext):
 
         voicemail_text = (agent_cfg.get("voicemail_message") or "").strip()
         if amd_result == "machine" and voicemail_text:
-            await say_humanized(session, voicemail_text, allow_interruptions=False)
+            await say_humanized(session, voicemail_text, allow_interruptions=False, pronunciation_guide=pronunciation_guide)
             db.update_call(
                 ctx.room.name,
                 was_voicemail=True,
@@ -600,17 +796,20 @@ async def entrypoint(ctx: agents.JobContext):
             await ctx.room.disconnect()
             return
 
-        greeting_text = inbound_first_line if call_direction == "inbound" else (agent_cfg.get("first_line") or "Hello! How can I help you today?")
+        greeting_template = inbound_first_line if call_direction == "inbound" else (
+            agent_cfg.get("first_line") or "Hello! How can I help you today?"
+        )
+        greeting_text = inject_lead_context(greeting_template, lead or {}, campaign or {})
         if is_demo and not agent_cfg.get("first_line"):
             greeting_text = "Hello! Welcome to the demo. How can I help you today?"
         consent_text = (agent_cfg.get("consent_disclosure") or "").strip()
         if consent_text:
-            await say_humanized(session, consent_text, allow_interruptions=False)
+            await say_humanized(session, consent_text, allow_interruptions=False, pronunciation_guide=pronunciation_guide)
             await asyncio.sleep(0.5)
             db.update_call(ctx.room.name, consent_disclosed=True)
         inbound_speaks_first = bool(agent_cfg.get("inbound_speaks_first", True))
         if call_direction != "inbound" or inbound_speaks_first:
-            await say_humanized(session, greeting_text, allow_interruptions=True)
+            await say_humanized(session, greeting_text, allow_interruptions=True, pronunciation_guide=pronunciation_guide)
 
         dtmf_menu = agent_cfg.get("dtmf_menu")
         if isinstance(dtmf_menu, str):
@@ -619,7 +818,12 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception:
                 dtmf_menu = None
         if isinstance(dtmf_menu, dict) and dtmf_menu.get("prompt"):
-            await say_humanized(session, str(dtmf_menu.get("prompt")), allow_interruptions=False)
+            await say_humanized(
+                session,
+                str(dtmf_menu.get("prompt")),
+                allow_interruptions=False,
+                pronunciation_guide=pronunciation_guide,
+            )
             timeout_seconds = int(dtmf_menu.get("timeout_seconds") or 5)
             await asyncio.sleep(max(1, min(timeout_seconds, 20)))
             pressed_key = str(meta.get("dtmf_digit") or "").strip()
@@ -628,7 +832,8 @@ async def entrypoint(ctx: agents.JobContext):
                 logging.info("[DTMF] %s pressed %s", phone, pressed_key)
                 script = db.get_script(str(options.get(pressed_key)))
                 if script:
-                    await say_humanized(session, script.get("first_line") or "Thank you, connecting you now.")
+                    routed_line = inject_lead_context(script.get("first_line") or "Thank you, connecting you now.", lead or {}, campaign or {})
+                    await say_humanized(session, routed_line, pronunciation_guide=pronunciation_guide)
 
         asyncio.create_task(
             asyncio.to_thread(
@@ -645,7 +850,16 @@ async def entrypoint(ctx: agents.JobContext):
 
         threshold = int(agent_cfg.get("silence_threshold_seconds", 20) or 20)
         max_nudges = int(agent_cfg.get("max_nudges", 2) or 2)
-        watchdog_task = asyncio.create_task(silence_watchdog(session, ctx, activity_state, threshold, max_nudges))
+        watchdog_task = asyncio.create_task(
+            silence_watchdog(
+                session,
+                ctx,
+                activity_state,
+                threshold,
+                max_nudges,
+                pronunciation_guide=pronunciation_guide,
+            )
+        )
 
         await session.wait()
 
