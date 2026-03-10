@@ -26,11 +26,19 @@ from livekit.plugins import sarvam, silero
 
 logger = logging.getLogger("agent")
 
-try:
-    db.initdb()
-    logger.info("STARTUP: DB init complete")
-except Exception as e:
-    logger.warning(f"STARTUP: DB init failed: {e}")
+_db_init_lock = asyncio.Lock()
+_db_initialized = False
+
+
+async def ensure_db_initialized() -> None:
+    global _db_initialized
+    if _db_initialized:
+        return
+    async with _db_init_lock:
+        if _db_initialized:
+            return
+        await asyncio.to_thread(db.initdb)
+        _db_initialized = True
 
 FILLERS_THINKING = ["Umm...", "Let me see...", "Acha..."]
 FILLERS_AGREEMENT = ["Haan ji,", "Bilkul,", "Theek hai,"]
@@ -555,6 +563,7 @@ async def post_call_handler(room_id: str, call_id: str, lead_id: str, agent_cfg:
 async def entrypoint(ctx: agents.JobContext):
     try:
         await ctx.connect()
+        await ensure_db_initialized()
 
         metadata_raw = ctx.job.metadata or ""
         is_demo = metadata_raw == "demo" or metadata_raw.startswith("demo")
@@ -880,4 +889,10 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+    agents.cli.run_app(
+        agents.WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="outbound-caller",
+            initialize_process_timeout=60.0,
+        )
+    )

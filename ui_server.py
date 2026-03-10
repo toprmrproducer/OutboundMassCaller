@@ -201,7 +201,7 @@ async def startup_event():
     except Exception:
         pass
     try:
-        db.initdb()
+        await asyncio.to_thread(db.initdb)
         logging.info("STARTUP: DB init complete")
     except Exception as e:
         logging.warning(f"STARTUP: DB init failed: {e}")
