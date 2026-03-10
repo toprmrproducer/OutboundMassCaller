@@ -1,9 +1,9 @@
 FROM node:20-alpine AS frontend-builder
 
-WORKDIR /ui
+WORKDIR /app/ui
 
-COPY frontend/package*.json ./
-RUN npm install
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci
 
 COPY frontend/ ./
 RUN npm run build
@@ -21,7 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-COPY --from=frontend-builder /ui/dist /app/frontend/dist
+COPY --from=frontend-builder /app/ui/dist /app/ui/dist
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 

@@ -36,7 +36,9 @@ import db
 app = FastAPI(title="RapidXAI Cold Calling API", version="2.0.0")
 
 BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
+UI_DIST_DIR = BASE_DIR / "ui" / "dist"
+LEGACY_FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
+FRONTEND_DIST_DIR = UI_DIST_DIR if UI_DIST_DIR.exists() else LEGACY_FRONTEND_DIST_DIR
 FRONTEND_INDEX_PATH = FRONTEND_DIST_DIR / "index.html"
 FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
 
