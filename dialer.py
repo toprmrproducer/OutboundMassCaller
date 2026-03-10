@@ -8,6 +8,7 @@ import pytz
 from campaign_runner import get_shutdown_event
 import db
 from holidays.holiday_engine import is_holiday_today
+from ml.best_time import get_best_call_hours, should_call_now
 from number_health.spam_checker import pick_best_number
 
 _active_dialers: dict[str, asyncio.Task] = {}
@@ -32,6 +33,8 @@ async def _run_campaign(campaign_id: str):
     from ui_server import dispatch_outbound_call
 
     shutdown_event = get_shutdown_event()
+    best_hours: list[int] = []
+    best_hours_refreshed_at: datetime | None = None
     while True:
         try:
             if shutdown_event.is_set():
@@ -40,6 +43,42 @@ async def _run_campaign(campaign_id: str):
             campaign = db.get_campaign(campaign_id)
             if not campaign or campaign["status"] not in ("active",):
                 break
+
+            if campaign.get("requires_approval") and campaign.get("approval_status") != "approved":
+                logging.info("[APPROVAL] Campaign %s waiting for approval; skipping cycle.", campaign_id)
+                await asyncio.sleep(30)
+                continue
+
+            budget_cap = campaign.get("budget_cap_usd")
+            if budget_cap is not None:
+                spend = db.get_campaign_spend(campaign_id)
+                try:
+                    cap = float(budget_cap)
+                except Exception:
+                    cap = 0.0
+                if cap > 0:
+                    if spend >= cap:
+                        calls_made = db.get_campaign_call_count(campaign_id)
+                        db.update_campaign(
+                            campaign_id,
+                            status="paused",
+                            paused_at=datetime.utcnow().isoformat(),
+                            pause_reason="budget_cap_reached",
+                            calls_made_before_pause=calls_made,
+                        )
+                        logging.info("[BUDGET] Campaign %s hit budget cap of $%s. Paused.", campaign_id, cap)
+                        break
+                    if spend >= cap * 0.9:
+                        logging.warning("[BUDGET] Campaign %s at 90%% of budget cap.", campaign_id)
+
+            now_utc = datetime.utcnow()
+            if best_hours_refreshed_at is None or (now_utc - best_hours_refreshed_at) >= timedelta(minutes=30):
+                best_hours = get_best_call_hours(campaign_id, db_conn=None)
+                best_hours_refreshed_at = now_utc
+            if not should_call_now(campaign_id, campaign.get("timezone", "Asia/Kolkata"), best_hours):
+                logging.info("[PREDICTOR] Suboptimal hour for campaign %s. Skipping cycle.", campaign_id)
+                await asyncio.sleep(30)
+                continue
 
             is_holiday, holiday_name = is_holiday_today(str(campaign.get("business_id")))
             if is_holiday:
@@ -50,7 +89,15 @@ async def _run_campaign(campaign_id: str):
             if not _in_call_window(campaign):
                 next_open = _next_window_open(campaign)
                 logging.info("[SCHEDULER] Campaign %s outside call window. Next window opens at %s.", campaign_id, next_open)
-                await asyncio.sleep(60)
+                wait_seconds = 60
+                try:
+                    tz = pytz.timezone(campaign.get("timezone", "Asia/Kolkata"))
+                    now_local = datetime.now(tz)
+                    next_open_dt = datetime.fromisoformat(next_open)
+                    wait_seconds = max(60, int((next_open_dt - now_local).total_seconds()))
+                except Exception:
+                    wait_seconds = 60
+                await asyncio.sleep(min(wait_seconds, 3600))
                 continue
 
             trunk_id = str(campaign["sip_trunk_id"])
@@ -86,6 +133,7 @@ async def _run_campaign(campaign_id: str):
                 if not requeued:
                     db.update_campaign(campaign_id, status="completed", completed_at=datetime.utcnow().isoformat())
                     logging.info(f"[DIALER] Campaign {campaign_id} completed")
+                    await _advance_sequence_if_needed(campaign_id)
                     break
                 await asyncio.sleep(10)
                 continue
@@ -151,6 +199,76 @@ async def _run_campaign(campaign_id: str):
         except Exception as e:
             logging.error(f"[DIALER] Error: {e}")
             await asyncio.sleep(10)
+
+
+async def _advance_sequence_if_needed(campaign_id: str):
+    seq = db.get_campaign_sequence(campaign_id)
+    if not seq:
+        return
+    steps = db.get_sequence_steps(str(seq.get("sequence_id")))
+    if not steps:
+        return
+
+    current_order = int(seq.get("step_order") or 0)
+    next_steps = [s for s in steps if int(s.get("step_order") or 0) > current_order]
+    if not next_steps:
+        return
+    next_step = sorted(next_steps, key=lambda s: int(s.get("step_order") or 0))[0]
+    next_campaign_id = str(next_step.get("campaign_id") or "")
+    if not next_campaign_id:
+        return
+
+    src_campaign = db.get_campaign(campaign_id) or {}
+    dst_campaign = db.get_campaign(next_campaign_id) or {}
+    if not src_campaign or not dst_campaign:
+        return
+
+    all_leads = db.get_leads(campaign_id, status=None, limit=50000, offset=0)
+    filter_disposition = (next_step.get("filter_disposition") or "").strip()
+    import_rows = []
+    for lead in all_leads:
+        if filter_disposition:
+            history = db.get_call_history_for_lead(str(lead.get("id")))
+            latest = history[0] if history else {}
+            if str((latest or {}).get("disposition") or "").lower() != filter_disposition.lower():
+                continue
+        import_rows.append(
+            {
+                "phone": lead.get("phone"),
+                "name": lead.get("name"),
+                "email": lead.get("email"),
+                "language": lead.get("language") or "hi-IN",
+                "custom_data": lead.get("custom_data") or {},
+            }
+        )
+    moved = db.bulk_create_leads(next_campaign_id, str(dst_campaign.get("business_id")), import_rows)
+
+    trigger = str(next_step.get("trigger") or "previous_complete")
+    delay_days = int(next_step.get("delay_days") or 0)
+    if trigger == "manual":
+        logging.info("[SEQUENCE] Wave complete. Next wave %s is manual for %s leads.", next_campaign_id, moved)
+        return
+
+    scheduled_start = datetime.utcnow() + timedelta(days=max(delay_days, 0))
+    if trigger == "delay_days" or delay_days > 0:
+        db.update_campaign(next_campaign_id, status="scheduled", scheduled_start_at=scheduled_start.isoformat())
+        logging.info(
+            "[SEQUENCE] Wave %s complete. Scheduled wave %s for %s leads at %s.",
+            campaign_id,
+            next_campaign_id,
+            moved,
+            scheduled_start.isoformat(),
+        )
+        return
+
+    db.update_campaign(next_campaign_id, status="active", started_at=datetime.utcnow().isoformat())
+    await start_campaign(next_campaign_id)
+    logging.info(
+        "[SEQUENCE] Wave %s complete. Starting wave %s for %s leads.",
+        campaign_id,
+        next_campaign_id,
+        moved,
+    )
 
 
 async def run_scheduled_callbacks():

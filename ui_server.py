@@ -370,6 +370,11 @@ class CampaignCreate(BaseModel):
     call_window_end: str = "20:00"
     timezone: str = "Asia/Kolkata"
     custom_script: Optional[str] = None
+    skip_sundays: bool = True
+    retry_strategy: Optional[dict] = None
+    budget_cap_usd: Optional[float] = None
+    requires_approval: bool = False
+    approval_status: Optional[str] = None
     scheduled_start_at: Optional[str] = None
 
 
@@ -382,9 +387,25 @@ class CampaignUpdate(BaseModel):
     max_concurrent_calls: Optional[int] = None
     retry_failed: Optional[bool] = None
     max_retries: Optional[int] = None
+    retry_delay_minutes: Optional[int] = None
     call_window_start: Optional[str] = None
     call_window_end: Optional[str] = None
+    timezone: Optional[str] = None
     custom_script: Optional[str] = None
+    skip_sundays: Optional[bool] = None
+    retry_strategy: Optional[dict] = None
+    budget_cap_usd: Optional[float] = None
+    requires_approval: Optional[bool] = None
+    approval_status: Optional[str] = None
+    approved_by: Optional[str] = None
+    approval_notes: Optional[str] = None
+    approved_at: Optional[str] = None
+    paused_at: Optional[str] = None
+    pause_reason: Optional[str] = None
+    calls_made_before_pause: Optional[int] = None
+    scheduled_start_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
     status: Optional[str] = None
 
 
@@ -521,6 +542,48 @@ class BookingPatchBody(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
     start_time: Optional[str] = None
+
+
+class CampaignTemplateCreateBody(BaseModel):
+    business_id: str
+    name: str
+    description: Optional[str] = None
+    config: dict
+
+
+class CampaignCloneBody(BaseModel):
+    business_id: str
+    new_name: str
+    include_leads: bool = False
+
+
+class CampaignApprovalBody(BaseModel):
+    business_id: str
+    approved_by: str
+    notes: Optional[str] = None
+
+
+class CampaignPauseBody(BaseModel):
+    business_id: str
+    reason: Optional[str] = None
+
+
+class CampaignResumeBody(BaseModel):
+    business_id: str
+
+
+class CampaignSequenceCreateBody(BaseModel):
+    business_id: str
+    name: str
+
+
+class CampaignSequenceStepBody(BaseModel):
+    business_id: str
+    campaign_id: str
+    step_order: int
+    trigger: str = "previous_complete"
+    delay_days: int = 0
+    filter_disposition: Optional[str] = None
 
 
 class SupervisorJoinBody(BaseModel):
@@ -726,6 +789,10 @@ async def _scheduled_campaign_autostart_loop():
 
                 for campaign in due:
                     cid = str(campaign["id"])
+                    if campaign.get("requires_approval") and campaign.get("approval_status") != "approved":
+                        db.update_campaign(cid, status="pending_approval", approval_status="pending")
+                        logging.info("[SCHEDULER] Campaign %s requires approval before auto-start", cid)
+                        continue
                     db.update_campaign(cid, status="active", started_at=datetime_now_iso())
                     asyncio.create_task(dialer.start_campaign(cid))
                     logging.info("[SCHEDULER] Auto-started campaign %s", cid)
@@ -1234,7 +1301,11 @@ def activate_agent(id: str):
 
 @app.post("/api/campaigns")
 def create_campaign(body: CampaignCreate, request: Request):
-    row = db.create_campaign(**body.model_dump())
+    payload = body.model_dump(exclude_none=True)
+    if payload.get("requires_approval") and payload.get("status") == "active":
+        payload["status"] = "pending_approval"
+        payload["approval_status"] = "pending"
+    row = db.create_campaign(**payload)
     if not row:
         raise HTTPException(status_code=400, detail="Failed to create campaign")
     actor = _actor_from_request(request)
@@ -1257,7 +1328,11 @@ def get_campaigns(business_id: Optional[str] = Query(default=None)):
 
 
 @app.get("/api/campaigns/{id}")
-def get_campaign(id: str):
+def get_campaign(id: str, business_id: Optional[str] = Query(default=None)):
+    if id == "pending-approval":
+        if not business_id:
+            return _error("business_id is required", 400)
+        return _success(db.get_pending_approval_campaigns(business_id))
     row = db.get_campaign(id)
     if not row:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -1298,7 +1373,17 @@ def campaign_quality_distribution(id: str, business_id: str = Query(...)):
 
 @app.put("/api/campaigns/{id}")
 def update_campaign(id: str, body: CampaignUpdate, request: Request):
-    row = db.update_campaign(id, **body.model_dump(exclude_none=True))
+    current = db.get_campaign(id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    payload = body.model_dump(exclude_none=True)
+    if payload.get("status") == "active":
+        requires_approval = bool(payload.get("requires_approval", current.get("requires_approval")))
+        if requires_approval and str(current.get("approval_status") or "") != "approved":
+            payload["status"] = "pending_approval"
+            payload["approval_status"] = "pending"
+            logging.info("[APPROVAL] Campaign %s moved to pending_approval", id)
+    row = db.update_campaign(id, **payload)
     if not row:
         raise HTTPException(status_code=404, detail="Campaign not found or no updates")
     actor = _actor_from_request(request)
@@ -1340,23 +1425,56 @@ async def start_campaign(id: str):
     campaign = db.get_campaign(id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("requires_approval") and campaign.get("approval_status") != "approved":
+        db.update_campaign(id, status="pending_approval", approval_status="pending")
+        logging.info("[APPROVAL] Campaign %s requires approval; moved to pending_approval", id)
+        return _success({"status": "pending_approval"})
     db.update_campaign(id, status="active", started_at=datetime_now_iso())
     import dialer
 
     asyncio.create_task(dialer.start_campaign(id))
-    return {"status": "started"}
+    return _success({"status": "started"})
 
 
 @app.post("/api/campaigns/{id}/pause")
-async def pause_campaign(id: str):
+async def pause_campaign(id: str, body: Optional[CampaignPauseBody] = None):
     campaign = db.get_campaign(id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    db.update_campaign(id, status="paused")
+    if body and str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    calls_made = db.get_campaign_call_count(id)
+    reason = (body.reason if body and body.reason else "manual_pause")
+    db.update_campaign(
+        id,
+        status="paused",
+        paused_at=datetime_now_iso(),
+        pause_reason=reason,
+        calls_made_before_pause=calls_made,
+    )
+    reset_count = db.reset_campaign_calling_leads(id)
+    logging.info("[PAUSE] Reset %s in-flight leads to pending", reset_count)
     import dialer
 
     asyncio.create_task(dialer.stop_campaign(id))
-    return {"status": "paused"}
+    return _success({"status": "paused", "reset_count": reset_count})
+
+
+@app.post("/api/campaigns/{id}/resume")
+async def resume_campaign(id: str, body: CampaignResumeBody):
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    if campaign.get("requires_approval") and campaign.get("approval_status") != "approved":
+        db.update_campaign(id, status="pending_approval", approval_status="pending")
+        return _success({"status": "pending_approval"})
+    db.update_campaign(id, status="active", paused_at=None, pause_reason=None, started_at=datetime_now_iso())
+    import dialer
+
+    asyncio.create_task(dialer.start_campaign(id))
+    pending = int((db.get_campaign_stats(id) or {}).get("pending") or 0)
+    logging.info("[RESUME] Campaign %s resumed. %s leads remaining.", id, pending)
+    return _success({"status": "active", "pending": pending})
 
 
 @app.post("/api/campaigns/{id}/stop")
@@ -1368,7 +1486,7 @@ async def stop_campaign(id: str):
     import dialer
 
     asyncio.create_task(dialer.stop_campaign(id))
-    return {"status": "stopped"}
+    return _success({"status": "stopped"})
 
 
 @app.get("/api/campaigns/{id}/variants")
@@ -1399,6 +1517,132 @@ def get_variant_stats(id: str, business_id: str = Query(...)):
     if not campaign or str(campaign.get("business_id")) != str(business_id):
         return _error("Campaign not found", 404)
     return _success(db.get_campaign_variant_stats(id))
+
+
+@app.get("/api/campaign-templates")
+def get_campaign_templates_api(business_id: str = Query(...)):
+    logging.info("[TEMPLATE] list business_id=%s", business_id)
+    return _success(db.get_campaign_templates(business_id))
+
+
+@app.post("/api/campaign-templates")
+def create_campaign_template_api(body: CampaignTemplateCreateBody):
+    logging.info("[TEMPLATE] create business_id=%s name=%s", body.business_id, body.name)
+    row = db.create_campaign_template(body.business_id, body.name, body.description, body.config)
+    if not row:
+        return _error("Failed to create campaign template", 400)
+    return _success(row)
+
+
+@app.delete("/api/campaign-templates/{id}")
+def delete_campaign_template_api(id: str, business_id: str = Query(...)):
+    logging.info("[TEMPLATE] delete id=%s business_id=%s", id, business_id)
+    row = next((x for x in db.get_campaign_templates(business_id) if str(x.get("id")) == str(id)), None)
+    if not row:
+        return _error("Template not found", 404)
+    ok = db.delete_campaign_template(id)
+    if not ok:
+        return _error("Template not found", 404)
+    return _success({"deleted": True})
+
+
+@app.post("/api/campaigns/{id}/clone")
+def clone_campaign_api(id: str, body: CampaignCloneBody):
+    logging.info("[CLONE] campaign_id=%s business_id=%s include_leads=%s", id, body.business_id, body.include_leads)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    cloned = db.clone_campaign(id, body.new_name, include_leads=body.include_leads)
+    if not cloned:
+        return _error("Failed to clone campaign", 400)
+    return _success(cloned)
+
+
+@app.post("/api/campaigns/{id}/submit-for-approval")
+def submit_campaign_for_approval(id: str, business_id: str = Query(...)):
+    logging.info("[APPROVAL] submit campaign_id=%s business_id=%s", id, business_id)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    row = db.update_campaign(id, status="pending_approval", approval_status="pending")
+    if not row:
+        return _error("Failed to submit campaign for approval", 400)
+    return _success(row)
+
+
+@app.post("/api/campaigns/{id}/approve")
+def approve_campaign_api(id: str, body: CampaignApprovalBody):
+    logging.info("[APPROVAL] approve campaign_id=%s business_id=%s by=%s", id, body.business_id, body.approved_by)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    row = db.approve_campaign(id, body.approved_by, body.notes)
+    if not row:
+        return _error("Failed to approve campaign", 400)
+    return _success(row)
+
+
+@app.post("/api/campaigns/{id}/reject")
+def reject_campaign_api(id: str, body: CampaignApprovalBody):
+    logging.info("[APPROVAL] reject campaign_id=%s business_id=%s by=%s", id, body.business_id, body.approved_by)
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    row = db.reject_campaign(id, body.approved_by, body.notes)
+    if not row:
+        return _error("Failed to reject campaign", 400)
+    return _success(row)
+
+
+@app.get("/api/campaigns/pending-approval")
+def pending_approval_campaigns(business_id: str = Query(...)):
+    logging.info("[APPROVAL] pending list business_id=%s", business_id)
+    return _success(db.get_pending_approval_campaigns(business_id))
+
+
+@app.post("/api/campaign-sequences")
+def create_campaign_sequence_api(body: CampaignSequenceCreateBody):
+    logging.info("[SEQUENCE] create business_id=%s name=%s", body.business_id, body.name)
+    row = db.create_sequence(body.business_id, body.name)
+    if not row:
+        return _error("Failed to create sequence", 400)
+    return _success(row)
+
+
+@app.post("/api/campaign-sequences/{sequence_id}/steps")
+def add_campaign_sequence_step_api(sequence_id: str, body: CampaignSequenceStepBody):
+    logging.info("[SEQUENCE] add-step sequence_id=%s campaign_id=%s", sequence_id, body.campaign_id)
+    campaign = db.get_campaign(body.campaign_id)
+    if not campaign or str(campaign.get("business_id")) != str(body.business_id):
+        return _error("Campaign not found", 404)
+    row = db.add_sequence_step(
+        sequence_id=sequence_id,
+        campaign_id=body.campaign_id,
+        step_order=body.step_order,
+        trigger=body.trigger,
+        delay_days=body.delay_days,
+        filter_disposition=body.filter_disposition,
+    )
+    if not row:
+        return _error("Failed to add sequence step", 400)
+    return _success(row)
+
+
+@app.get("/api/campaign-sequences/{sequence_id}/steps")
+def get_campaign_sequence_steps_api(sequence_id: str, business_id: str = Query(...)):
+    logging.info("[SEQUENCE] steps sequence_id=%s business_id=%s", sequence_id, business_id)
+    # Basic business scope check through campaigns joined in step list.
+    steps = db.get_sequence_steps(sequence_id)
+    filtered = [s for s in steps if str((db.get_campaign(str(s.get("campaign_id"))) or {}).get("business_id")) == str(business_id)]
+    return _success(filtered)
+
+
+@app.get("/api/campaigns/{id}/sequence")
+def get_campaign_sequence_api(id: str, business_id: str = Query(...)):
+    campaign = db.get_campaign(id)
+    if not campaign or str(campaign.get("business_id")) != str(business_id):
+        return _error("Campaign not found", 404)
+    return _success(db.get_campaign_sequence(id))
 
 
 # Leads

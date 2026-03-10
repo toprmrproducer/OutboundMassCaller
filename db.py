@@ -281,6 +281,33 @@ def initdb():
       created_at TIMESTAMPTZ DEFAULT now()
     );
 
+    CREATE TABLE IF NOT EXISTS campaign_templates (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      description TEXT,
+      config JSONB NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS campaign_sequences (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS campaign_sequence_steps (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      sequence_id UUID REFERENCES campaign_sequences(id) ON DELETE CASCADE,
+      campaign_id UUID REFERENCES campaigns(id) ON DELETE CASCADE,
+      step_order INT NOT NULL,
+      trigger TEXT DEFAULT 'previous_complete',
+      delay_days INT DEFAULT 0,
+      filter_disposition TEXT DEFAULT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
     CREATE TABLE IF NOT EXISTS holidays (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
@@ -422,6 +449,15 @@ def initdb():
         with conn, conn.cursor() as cur:
             cur.execute(_tables_sql)
             cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS skip_sundays BOOLEAN DEFAULT true")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS budget_cap_usd NUMERIC(10,2) DEFAULT NULL")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT false")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'not_required'")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_by TEXT")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approval_notes TEXT")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS pause_reason TEXT")
+            cur.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS calls_made_before_pause INT DEFAULT 0")
             cur.execute(
                 """
                 ALTER TABLE campaigns
@@ -971,6 +1007,15 @@ def create_campaign(**kwargs):
         "custom_script": None,
         "skip_sundays": True,
         "retry_strategy": None,
+        "budget_cap_usd": None,
+        "requires_approval": False,
+        "approval_status": "not_required",
+        "approved_by": None,
+        "approval_notes": None,
+        "approved_at": None,
+        "paused_at": None,
+        "pause_reason": None,
+        "calls_made_before_pause": 0,
         "scheduled_start_at": None,
         "started_at": None,
         "completed_at": None,
@@ -988,12 +1033,16 @@ def create_campaign(**kwargs):
                  status, calls_per_minute, max_concurrent_calls, retry_failed,
                  max_retries, retry_delay_minutes, call_window_start, call_window_end,
                  timezone, custom_script, skip_sundays, retry_strategy,
+                 budget_cap_usd, requires_approval, approval_status, approved_by,
+                 approval_notes, approved_at, paused_at, pause_reason, calls_made_before_pause,
                  scheduled_start_at, started_at, completed_at)
                 VALUES
                 (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s,
                  %s, %s, %s, %s,
                  %s, %s, %s, %s,
-                 %s, %s, %s, %s::jsonb, %s, %s, %s)
+                 %s, %s, %s, %s::jsonb,
+                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                 %s, %s, %s)
                 RETURNING *
                 """,
                 (
@@ -1003,6 +1052,15 @@ def create_campaign(**kwargs):
                     defaults["max_retries"], defaults["retry_delay_minutes"], defaults["call_window_start"], defaults["call_window_end"],
                     defaults["timezone"], defaults["custom_script"], defaults["skip_sundays"],
                     json.dumps(defaults["retry_strategy"]) if defaults["retry_strategy"] else None,
+                    defaults["budget_cap_usd"],
+                    defaults["requires_approval"],
+                    defaults["approval_status"],
+                    defaults["approved_by"],
+                    defaults["approval_notes"],
+                    defaults["approved_at"],
+                    defaults["paused_at"],
+                    defaults["pause_reason"],
+                    defaults["calls_made_before_pause"],
                     defaults["scheduled_start_at"], defaults["started_at"], defaults["completed_at"],
                 ),
             )
@@ -1053,7 +1111,10 @@ def update_campaign(id, **kwargs):
         "name", "description", "objective", "agent_id", "sip_trunk_id", "status",
         "calls_per_minute", "max_concurrent_calls", "retry_failed", "max_retries",
         "retry_delay_minutes", "call_window_start", "call_window_end", "timezone",
-        "custom_script", "skip_sundays", "retry_strategy", "scheduled_start_at", "started_at", "completed_at",
+        "custom_script", "skip_sundays", "retry_strategy",
+        "budget_cap_usd", "requires_approval", "approval_status", "approved_by", "approval_notes", "approved_at",
+        "paused_at", "pause_reason", "calls_made_before_pause",
+        "scheduled_start_at", "started_at", "completed_at",
     }
     update_data = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not update_data:
@@ -1324,6 +1385,389 @@ def get_campaign_variant_stats(campaign_id):
     except Exception as e:
         logger.exception("get_campaign_variant_stats failed: %s", e)
         return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_hourly_connection_rates(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour,
+                  COUNT(*)::int AS total_calls,
+                  COUNT(*) FILTER (WHERE status='completed')::int AS connected,
+                  ROUND(
+                    (COUNT(*) FILTER (WHERE status='completed')::numeric / NULLIF(COUNT(*), 0)) * 100,
+                    2
+                  ) AS connection_rate
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                GROUP BY 1
+                ORDER BY hour ASC
+                """,
+                (campaign_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_hourly_connection_rates failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_campaign_template(business_id, name, description, config):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO campaign_templates (business_id, name, description, config)
+                VALUES (%s::uuid, %s, %s, %s::jsonb)
+                RETURNING *
+                """,
+                (business_id, name, description, json.dumps(config or {})),
+            )
+            return _dict(cur.fetchone())
+    except Exception as e:
+        logger.exception("create_campaign_template failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_templates(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM campaign_templates WHERE business_id=%s::uuid ORDER BY created_at DESC",
+                (business_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_campaign_templates failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def delete_campaign_template(id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM campaign_templates WHERE id=%s::uuid", (id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.exception("delete_campaign_template failed: %s", e)
+        return False
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def clone_campaign(campaign_id, new_name, include_leads=False):
+    conn = None
+    try:
+        source = get_campaign(campaign_id)
+        if not source:
+            return {}
+        payload = {
+            "business_id": source.get("business_id"),
+            "agent_id": source.get("agent_id"),
+            "sip_trunk_id": source.get("sip_trunk_id"),
+            "name": new_name,
+            "description": source.get("description"),
+            "objective": source.get("objective"),
+            "status": "draft",
+            "calls_per_minute": source.get("calls_per_minute"),
+            "max_concurrent_calls": source.get("max_concurrent_calls"),
+            "retry_failed": source.get("retry_failed"),
+            "max_retries": source.get("max_retries"),
+            "retry_delay_minutes": source.get("retry_delay_minutes"),
+            "call_window_start": source.get("call_window_start"),
+            "call_window_end": source.get("call_window_end"),
+            "timezone": source.get("timezone"),
+            "custom_script": source.get("custom_script"),
+            "skip_sundays": source.get("skip_sundays", True),
+            "retry_strategy": source.get("retry_strategy"),
+            "budget_cap_usd": source.get("budget_cap_usd"),
+            "requires_approval": source.get("requires_approval", False),
+            "approval_status": "not_required",
+            "calls_made_before_pause": 0,
+        }
+        cloned = create_campaign(**payload)
+        if not cloned:
+            return {}
+
+        if include_leads:
+            source_leads = get_leads(campaign_id, status=None, limit=50000, offset=0)
+            insert_rows = []
+            for lead in source_leads:
+                if str(lead.get("status") or "") not in {"pending", "scheduled"}:
+                    continue
+                insert_rows.append(
+                    {
+                        "phone": lead.get("phone"),
+                        "name": lead.get("name"),
+                        "email": lead.get("email"),
+                        "language": lead.get("language") or "hi-IN",
+                        "custom_data": lead.get("custom_data") or {},
+                    }
+                )
+            if insert_rows:
+                bulk_create_leads(str(cloned["id"]), str(cloned["business_id"]), insert_rows)
+
+        return cloned
+    except Exception as e:
+        logger.exception("clone_campaign failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_spend(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(estimated_cost_usd), 0)::numeric(12,4) AS total
+                FROM calls
+                WHERE campaign_id=%s::uuid
+                  AND status != 'initiated'
+                """,
+                (campaign_id,),
+            )
+            row = _dict(cur.fetchone()) or {}
+            return float(row.get("total") or 0.0)
+    except Exception as e:
+        logger.exception("get_campaign_spend failed: %s", e)
+        return 0.0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_call_count(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*)::int AS c FROM calls WHERE campaign_id=%s::uuid", (campaign_id,))
+            return int((_dict(cur.fetchone()) or {}).get("c") or 0)
+    except Exception as e:
+        logger.exception("get_campaign_call_count failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def reset_campaign_calling_leads(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE leads SET status='pending' WHERE campaign_id=%s::uuid AND status='calling'",
+                (campaign_id,),
+            )
+            return cur.rowcount
+    except Exception as e:
+        logger.exception("reset_campaign_calling_leads failed: %s", e)
+        return 0
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def approve_campaign(id, approved_by, notes):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET approval_status='approved',
+                    approved_by=%s,
+                    approval_notes=%s,
+                    approved_at=NOW(),
+                    status=CASE WHEN status='pending_approval' THEN 'active' ELSE status END
+                WHERE id=%s::uuid
+                RETURNING *
+                """,
+                (approved_by, notes, id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("approve_campaign failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def reject_campaign(id, approved_by, notes):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET approval_status='rejected',
+                    approved_by=%s,
+                    approval_notes=%s,
+                    approved_at=NOW(),
+                    status='paused'
+                WHERE id=%s::uuid
+                RETURNING *
+                """,
+                (approved_by, notes, id),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("reject_campaign failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_pending_approval_campaigns(business_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM campaigns
+                WHERE business_id=%s::uuid
+                  AND approval_status='pending'
+                ORDER BY created_at DESC
+                """,
+                (business_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_pending_approval_campaigns failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def create_sequence(business_id, name):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO campaign_sequences (business_id, name)
+                VALUES (%s::uuid, %s)
+                RETURNING *
+                """,
+                (business_id, name),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("create_sequence failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def add_sequence_step(sequence_id, campaign_id, step_order, trigger="previous_complete", delay_days=0, filter_disposition=None):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO campaign_sequence_steps
+                (sequence_id, campaign_id, step_order, trigger, delay_days, filter_disposition)
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (sequence_id, campaign_id, int(step_order), trigger, int(delay_days or 0), filter_disposition),
+            )
+            return _dict(cur.fetchone()) or {}
+    except Exception as e:
+        logger.exception("add_sequence_step failed: %s", e)
+        return {}
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_sequence_steps(sequence_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT css.*, c.name AS campaign_name
+                FROM campaign_sequence_steps css
+                LEFT JOIN campaigns c ON c.id = css.campaign_id
+                WHERE css.sequence_id=%s::uuid
+                ORDER BY css.step_order ASC
+                """,
+                (sequence_id,),
+            )
+            return _list(cur.fetchall())
+    except Exception as e:
+        logger.exception("get_sequence_steps failed: %s", e)
+        return []
+    finally:
+        if conn is not None:
+            release_conn(conn)
+
+
+def get_campaign_sequence(campaign_id):
+    conn = None
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  cs.id AS sequence_id,
+                  cs.business_id,
+                  cs.name AS sequence_name,
+                  css.id AS step_id,
+                  css.step_order,
+                  css.trigger,
+                  css.delay_days,
+                  css.filter_disposition
+                FROM campaign_sequence_steps css
+                JOIN campaign_sequences cs ON cs.id = css.sequence_id
+                WHERE css.campaign_id=%s::uuid
+                LIMIT 1
+                """,
+                (campaign_id,),
+            )
+            row = cur.fetchone()
+            return _dict(row) if row else None
+    except Exception as e:
+        logger.exception("get_campaign_sequence failed: %s", e)
+        return None
     finally:
         if conn is not None:
             release_conn(conn)
