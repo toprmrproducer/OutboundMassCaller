@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 
 import pytz
 
+from campaign_runner import get_shutdown_event
 import db
+from holidays.holiday_engine import is_holiday_today
+from number_health.spam_checker import pick_best_number
 
 _active_dialers: dict[str, asyncio.Task] = {}
 
@@ -28,11 +31,21 @@ async def stop_campaign(campaign_id: str):
 async def _run_campaign(campaign_id: str):
     from ui_server import dispatch_outbound_call
 
+    shutdown_event = get_shutdown_event()
     while True:
         try:
+            if shutdown_event.is_set():
+                logging.info("[RUNNER] Shutting down campaign %s", campaign_id)
+                break
             campaign = db.get_campaign(campaign_id)
             if not campaign or campaign["status"] not in ("active",):
                 break
+
+            is_holiday, holiday_name = is_holiday_today(str(campaign.get("business_id")))
+            if is_holiday:
+                logging.info("[HOLIDAY] %s - skipping dialing for campaign %s", holiday_name, campaign_id)
+                await asyncio.sleep(60)
+                continue
 
             if not _in_call_window(campaign):
                 next_open = _next_window_open(campaign)
@@ -98,6 +111,22 @@ async def _run_campaign(campaign_id: str):
             selected_agent_id = db.pick_variant_agent(campaign_id) or str(campaign["agent_id"])
             logging.info("[AB] Campaign %s selected variant agent %s for lead %s", campaign_id, selected_agent_id, lead["phone"])
 
+            number_pool = trunk.get("number_pool") or []
+            if isinstance(number_pool, str):
+                try:
+                    import json
+
+                    number_pool = json.loads(number_pool)
+                except Exception:
+                    number_pool = []
+            health_rows = db.get_number_health(trunk_id)
+            selected_from_number = pick_best_number(trunk, number_pool, health_rows)
+            if selected_from_number and (trunk.get("rotation_strategy") or "round_robin") == "round_robin":
+                ordered_pool = [str(n) for n in number_pool if str(n).strip()]
+                if ordered_pool and selected_from_number in ordered_pool:
+                    next_index = (ordered_pool.index(selected_from_number) + 1) % len(ordered_pool)
+                    db.update_sip_trunk(trunk_id, last_used_number_index=next_index)
+
             asyncio.create_task(
                 dispatch_outbound_call(
                     phone=lead["phone"],
@@ -108,8 +137,11 @@ async def _run_campaign(campaign_id: str):
                     lead_id=str(lead["id"]),
                     script_override=None,
                     call_attempt_number=int(lead.get("call_attempts", 0)),
+                    from_number=selected_from_number,
                 )
             )
+            if selected_from_number:
+                db.increment_number_usage(trunk_id, selected_from_number)
 
             interval = 60.0 / max(int(campaign["calls_per_minute"]), 1)
             await asyncio.sleep(interval)
@@ -125,8 +157,12 @@ async def run_scheduled_callbacks():
     """Run continuously to fire scheduled callbacks."""
     from ui_server import dispatch_outbound_call
 
+    shutdown_event = get_shutdown_event()
     while True:
         try:
+            if shutdown_event.is_set():
+                logging.info("[CALLBACKS] Shutdown requested")
+                break
             due = db.get_due_callbacks()
             for cb in due:
                 campaign = db.get_campaign(str(cb["campaign_id"]))

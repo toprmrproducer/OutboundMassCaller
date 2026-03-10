@@ -12,13 +12,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from config.validator import assert_valid_env
+from logging_config import configure_logging
+
+configure_logging()
+assert_valid_env()
+
 import db
 from livekit import agents
 from livekit.agents import Agent, AgentSession, function_tool
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import sarvam, silero
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
 
 try:
@@ -214,7 +219,7 @@ class CallTools:
         try:
             normalized = date_time.replace(" ", "T")
             start_time = datetime.fromisoformat(normalized)
-            db.create_booking(
+            booking = db.create_booking(
                 call_id=self.call_id,
                 business_id=self.business_id,
                 caller_name=caller_name,
@@ -226,6 +231,22 @@ class CallTools:
             db.update_call(self.ctx.room.name, was_booked=True, disposition="booked")
             if self.lead_id:
                 db.update_lead_status(self.lead_id, "completed")
+            try:
+                business = db.get_business(self.business_id)
+                lead = db.get_lead(self.lead_id) if self.lead_id else {"phone": caller_phone, "name": caller_name}
+                if business and bool(business.get("reminder_enabled", True)) and booking:
+                    from reminders.reminder_scheduler import schedule_reminders_for_booking
+
+                    created = schedule_reminders_for_booking(
+                        booking=booking,
+                        business=business,
+                        lead=lead or {"phone": caller_phone, "name": caller_name},
+                        agent_id=self._agent_id or str(self.business_id),
+                        db_conn=None,
+                    )
+                    logging.info("[REMINDER] Scheduled %s reminder calls for booking %s", len(created), booking.get("id"))
+            except Exception as reminder_err:
+                logging.warning("[REMINDER] Failed to schedule reminders: %s", reminder_err)
             logging.info(f"[TOOL] Booking created: {date_time}")
             return f"Appointment booked for {date_time}"
         except Exception as e:
@@ -340,6 +361,8 @@ async def entrypoint(ctx: agents.JobContext):
         sip_trunk_id = meta.get("sip_trunk_id")
         script_override = meta.get("script_override")
         call_attempt = int(meta.get("call_attempt_number", 1) or 1)
+        call_direction = str(meta.get("call_direction") or "outbound").lower()
+        inbound_first_line = meta.get("inbound_first_line")
 
         business_id_from_meta = meta.get("business_id")
         agent_cfg = db.get_active_agent(business_id=business_id_from_meta)
@@ -364,6 +387,7 @@ async def entrypoint(ctx: agents.JobContext):
             phone=phone,
             room_id=ctx.room.name,
             call_attempt_number=call_attempt,
+            call_direction=call_direction,
         )
         call_id = str(call_record.get("id", ""))
 
@@ -407,6 +431,7 @@ async def entrypoint(ctx: agents.JobContext):
             activity_state["last_activity"] = time.time()
             activity_state["last_user_text"] = text
             db.append_transcript_line(ctx.room.name, phone, "user", text, turn_counter["n"])
+            db.update_active_call_turn(ctx.room.name, "user", text)
 
         @session.on("agent_speech_committed")
         def _on_agent_speech(ev):
@@ -416,13 +441,16 @@ async def entrypoint(ctx: agents.JobContext):
             turn_counter["n"] += 1
             activity_state["last_activity"] = time.time()
             db.append_transcript_line(ctx.room.name, phone, "assistant", text, turn_counter["n"])
+            db.update_active_call_turn(ctx.room.name, "assistant", text)
 
         await session.start(room=ctx.room, agent=voice_agent)
 
-        greeting_text = agent_cfg.get("first_line") or "Hello! How can I help you today?"
+        greeting_text = inbound_first_line if call_direction == "inbound" else (agent_cfg.get("first_line") or "Hello! How can I help you today?")
         if is_demo and not agent_cfg.get("first_line"):
             greeting_text = "Hello! Welcome to the demo. How can I help you today?"
-        await say_humanized(session, greeting_text, allow_interruptions=True)
+        inbound_speaks_first = bool(agent_cfg.get("inbound_speaks_first", True))
+        if call_direction != "inbound" or inbound_speaks_first:
+            await say_humanized(session, greeting_text, allow_interruptions=True)
 
         asyncio.create_task(
             asyncio.to_thread(

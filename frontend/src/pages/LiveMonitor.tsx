@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Line, LineChart, ResponsiveContainer, Tooltip } from "recharts";
+import LiveTranscript from "../components/LiveTranscript";
 
 type ActiveCall = {
   room_id: string;
@@ -30,6 +31,7 @@ export default function LiveMonitor() {
     booked_today: 0,
   });
   const [series, setSeries] = useState<Array<{ t: string; v: number }>>([]);
+  const [selectedRoomId, setSelectedRoomId] = useState<string>("");
   const retryRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -133,7 +135,11 @@ export default function LiveMonitor() {
                   </tr>
                 ) : (
                   rows.map((r) => (
-                    <tr key={r.room_id} className="border-b last:border-b-0">
+                    <tr
+                      key={r.room_id}
+                      className="cursor-pointer border-b last:border-b-0 hover:bg-slate-50"
+                      onClick={() => setSelectedRoomId(r.room_id)}
+                    >
                       <td className="py-2 pr-3 font-medium">{r.phone}</td>
                       <td className="py-2 pr-3 text-slate-600">{r.campaign_id || "-"}</td>
                       <td className="py-2 pr-3 text-slate-600">{r.agent_id || "-"}</td>
@@ -148,6 +154,8 @@ export default function LiveMonitor() {
             </table>
           </div>
         </div>
+
+        {selectedRoomId ? <LiveTranscript roomId={selectedRoomId} /> : null}
 
         <div className="rounded-xl border bg-white p-4 shadow-sm">
           <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">

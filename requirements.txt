@@ -19,3 +19,7 @@ python-json-logger>=2.0.7
 tiktoken>=0.7.0
 certifi>=2024.2.2
 pgvector>=0.3.0
+redis>=5.0.4
+requests>=2.32.0
+phonenumbers>=8.13.47
+reportlab>=4.2.0

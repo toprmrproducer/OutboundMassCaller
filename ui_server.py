@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import signal
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -18,6 +19,13 @@ from livekit.api import AccessToken, VideoGrants
 from pydantic import BaseModel
 
 load_dotenv()
+
+from config.validator import assert_valid_env
+from jobs.queue import job_queue
+from logging_config import configure_logging
+
+configure_logging()
+assert_valid_env()
 
 import db
 
@@ -37,6 +45,13 @@ _live_filters: dict[WebSocket, Optional[str]] = {}
 _live_broadcast_task: Optional[asyncio.Task] = None
 _scheduled_campaigns_task: Optional[asyncio.Task] = None
 _import_jobs: dict[str, dict] = {}
+_reminder_task: Optional[asyncio.Task] = None
+_spam_monitor_task: Optional[asyncio.Task] = None
+_simulator_cleanup_task: Optional[asyncio.Task] = None
+_simulator_sessions: dict[str, dict] = {}
+_last_transcript_cursor: Optional[str] = None
+_shutdown_event = asyncio.Event()
+_signal_handlers_registered = False
 
 
 def _success(data):
@@ -47,18 +62,86 @@ def _error(message: str, status_code: int = 400):
     return JSONResponse(status_code=status_code, content={"data": None, "error": message})
 
 
+def register_signal_handlers():
+    global _signal_handlers_registered
+    if _signal_handlers_registered:
+        return
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(on_shutdown()))
+        except NotImplementedError:
+            # add_signal_handler is not available on some platforms (e.g. Windows)
+            continue
+    _signal_handlers_registered = True
+
+
 @app.on_event("startup")
 async def startup_event():
-    global _live_broadcast_task, _scheduled_campaigns_task
+    global _live_broadcast_task, _scheduled_campaigns_task, _reminder_task, _spam_monitor_task, _simulator_cleanup_task
+    register_signal_handlers()
+    _shutdown_event.clear()
+    try:
+        import campaign_runner
+
+        campaign_runner.clear_shutdown()
+    except Exception:
+        pass
     try:
         db.initdb()
         logging.info("STARTUP: DB init complete")
     except Exception as e:
         logging.warning(f"STARTUP: DB init failed: {e}")
+    await job_queue.start()
+    logging.info("STARTUP: Job queue started")
     if _live_broadcast_task is None or _live_broadcast_task.done():
         _live_broadcast_task = asyncio.create_task(_live_broadcast_loop())
     if _scheduled_campaigns_task is None or _scheduled_campaigns_task.done():
         _scheduled_campaigns_task = asyncio.create_task(_scheduled_campaign_autostart_loop())
+    if _reminder_task is None or _reminder_task.done():
+        from reminders.reminder_scheduler import run_reminder_dispatch_loop
+
+        _reminder_task = asyncio.create_task(run_reminder_dispatch_loop())
+    if _spam_monitor_task is None or _spam_monitor_task.done():
+        _spam_monitor_task = asyncio.create_task(_spam_monitor_loop())
+    if _simulator_cleanup_task is None or _simulator_cleanup_task.done():
+        _simulator_cleanup_task = asyncio.create_task(_simulator_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if _shutdown_event.is_set():
+        return
+    _shutdown_event.set()
+    try:
+        import campaign_runner
+
+        campaign_runner.request_shutdown()
+    except Exception:
+        pass
+    logging.info("[SHUTDOWN] Shutdown signal received")
+    try:
+        import dialer
+
+        for campaign in db.get_campaigns_active():
+            cid = str(campaign["id"])
+            await dialer.stop_campaign(cid)
+    except Exception as e:
+        logging.warning("[SHUTDOWN] Unable to stop dialers cleanly: %s", e)
+
+    for task in (_live_broadcast_task, _scheduled_campaigns_task, _reminder_task, _spam_monitor_task, _simulator_cleanup_task):
+        if task and not task.done():
+            task.cancel()
+
+    try:
+        reset_count = db.reset_inflight_leads()
+        logging.info("[SHUTDOWN] Reset %s in-flight leads to pending", reset_count)
+    except Exception as e:
+        logging.warning("[SHUTDOWN] Failed to reset in-flight leads: %s", e)
+
+    await asyncio.sleep(1)
+    db.close_pool()
+    logging.info("[SHUTDOWN] Graceful shutdown complete.")
 
 
 class BusinessCreate(BaseModel):
@@ -119,6 +202,7 @@ class AgentCreate(BaseModel):
     max_turns: int = 25
     silence_threshold_seconds: int = 20
     max_nudges: int = 2
+    inbound_speaks_first: bool = True
 
 
 class AgentUpdate(BaseModel):
@@ -138,6 +222,7 @@ class AgentUpdate(BaseModel):
     agent_instructions: Optional[str] = None
     max_turns: Optional[int] = None
     is_active: Optional[bool] = None
+    inbound_speaks_first: Optional[bool] = None
 
 
 class CampaignCreate(BaseModel):
@@ -261,6 +346,54 @@ class VariantSetBody(BaseModel):
     variants: List[VariantItem]
 
 
+class HolidayCreateBody(BaseModel):
+    business_id: str
+    name: str
+    date: str
+    is_recurring: bool = True
+    skip_calls: bool = True
+
+
+class SeedHolidaysBody(BaseModel):
+    business_id: str
+
+
+class SurveyCreateBody(BaseModel):
+    business_id: str
+    agent_id: str
+    question: str
+    response_type: str = "numeric"
+    valid_responses: List[str] = ["1", "2", "3", "4", "5"]
+    send_via: str = "whatsapp"
+    send_delay_minutes: int = 2
+    trigger_dispositions: List[str] = ["interested", "booked", "callback_requested"]
+
+
+class SurveyUpdateBody(BaseModel):
+    question: Optional[str] = None
+    response_type: Optional[str] = None
+    valid_responses: Optional[List[str]] = None
+    send_via: Optional[str] = None
+    send_delay_minutes: Optional[int] = None
+    trigger_dispositions: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+
+
+class SimulatorStartBody(BaseModel):
+    agent_id: str
+    mock_lead: Optional[dict] = None
+
+
+class SimulatorMessageBody(BaseModel):
+    content: str
+
+
+class BookingPatchBody(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    start_time: Optional[str] = None
+
+
 def _lk_client() -> lk_api.LiveKitAPI:
     return lk_api.LiveKitAPI(
         url=os.environ["LIVEKIT_URL"],
@@ -289,6 +422,7 @@ async def dispatch_outbound_call(
     lead_id: Optional[str],
     script_override: Optional[str],
     call_attempt_number: int = 1,
+    from_number: Optional[str] = None,
 ) -> dict:
     lk = _lk_client()
     try:
@@ -303,7 +437,7 @@ async def dispatch_outbound_call(
         metadata = json.dumps(
             {
                 "phone_number": phone,
-                "from_number": mask_number or trunk.get("phone_number"),
+                "from_number": from_number or mask_number or trunk.get("phone_number"),
                 "agent_id": agent_id,
                 "campaign_id": campaign_id,
                 "lead_id": lead_id,
@@ -314,16 +448,18 @@ async def dispatch_outbound_call(
             }
         )
 
-        await lk.sip.create_sip_participant(
-            lk_api.CreateSIPParticipantRequest(
-                room_name=room_name,
-                sip_trunk_id=trunk["trunk_id"],
-                sip_call_to=phone,
-                participant_identity=f"sip_{phone.replace('+', '')}",
-                participant_name="Caller",
-                wait_until_answered=True,
-            )
+        sip_req = lk_api.CreateSIPParticipantRequest(
+            room_name=room_name,
+            sip_trunk_id=trunk["trunk_id"],
+            sip_call_to=phone,
+            participant_identity=f"sip_{phone.replace('+', '')}",
+            participant_name="Caller",
+            wait_until_answered=True,
         )
+        if from_number:
+            sip_req.sip_number = from_number
+
+        await lk.sip.create_sip_participant(sip_req)
 
         await lk.agent_dispatch.create_dispatch(
             lk_api.CreateAgentDispatchRequest(room=room_name, agent_name="outbound-caller", metadata=metadata)
@@ -353,7 +489,8 @@ def _extract_pdf_text(data: bytes) -> str:
 
 
 async def _live_broadcast_loop():
-    while True:
+    global _last_transcript_cursor
+    while not _shutdown_event.is_set():
         try:
             if not _live_clients:
                 await asyncio.sleep(2)
@@ -366,6 +503,23 @@ async def _live_broadcast_loop():
                     await ws.send_json(payload)
                 except Exception:
                     stale.append(ws)
+            # Piggyback transcript events on the same websocket channel.
+            lines = db.get_recent_transcript_lines(_last_transcript_cursor, limit=200)
+            for line in lines:
+                event = {
+                    "event": "transcript_line",
+                    "room_id": line.get("room_id"),
+                    "role": "agent" if line.get("role") == "assistant" else line.get("role"),
+                    "content": line.get("content"),
+                    "turn_number": line.get("turn_number"),
+                    "timestamp": str(line.get("created_at")),
+                }
+                _last_transcript_cursor = str(line.get("created_at"))
+                for ws in list(_live_clients):
+                    try:
+                        await ws.send_json(event)
+                    except Exception:
+                        stale.append(ws)
             for ws in stale:
                 _live_clients.discard(ws)
                 _live_filters.pop(ws, None)
@@ -376,7 +530,7 @@ async def _live_broadcast_loop():
 
 
 async def _scheduled_campaign_autostart_loop():
-    while True:
+    while not _shutdown_event.is_set():
         try:
             due = db.get_campaigns_due_to_start()
             if due:
@@ -392,6 +546,63 @@ async def _scheduled_campaign_autostart_loop():
         await asyncio.sleep(60)
 
 
+async def _spam_monitor_loop():
+    from number_health.spam_checker import check_spam_score
+
+    while not _shutdown_event.is_set():
+        try:
+            trunks = db.get_sip_trunks()
+            for trunk in trunks:
+                pool = trunk.get("number_pool") or []
+                if isinstance(pool, str):
+                    try:
+                        pool = json.loads(pool)
+                    except Exception:
+                        pool = []
+                numbers = list({*(pool or []), trunk.get("phone_number")})
+                for phone in [p for p in numbers if p]:
+                    existing = next(
+                        (r for r in db.get_number_health(str(trunk["id"])) if str(r.get("phone_number")) == str(phone)),
+                        None,
+                    ) or {}
+                    result = await check_spam_score(
+                        phone_number=str(phone),
+                        calls_today=int(existing.get("calls_today") or 0),
+                        calls_per_number_limit=int(trunk.get("calls_per_number_limit") or 50),
+                    )
+                    is_paused = int(result.get("spam_score") or 0) >= 80
+                    pause_reason = "spam_flagged" if is_paused else None
+                    db.upsert_number_health(
+                        str(trunk["id"]),
+                        str(phone),
+                        spam_score=int(result.get("spam_score") or 0),
+                        spam_label=result.get("spam_label"),
+                        is_paused=is_paused,
+                        pause_reason=pause_reason,
+                    )
+                    if is_paused:
+                        logging.warning("[SPAM] Number %s flagged as spam. Paused.", phone)
+        except Exception as e:
+            logging.error("[SPAM] monitor loop error: %s", e)
+        await asyncio.sleep(3600)
+
+
+async def _simulator_cleanup_loop():
+    while not _shutdown_event.is_set():
+        try:
+            now_ts = datetime.utcnow().timestamp()
+            stale = []
+            for sid, payload in _simulator_sessions.items():
+                created = float(payload.get("created_ts") or now_ts)
+                if now_ts - created > 30 * 60:
+                    stale.append(sid)
+            for sid in stale:
+                _simulator_sessions.pop(sid, None)
+        except Exception as e:
+            logging.warning("[SIM] cleanup loop error: %s", e)
+        await asyncio.sleep(60)
+
+
 # Businesses
 
 @app.post("/api/businesses")
@@ -399,6 +610,12 @@ def create_business(body: BusinessCreate):
     row = db.create_business(**body.model_dump())
     if not row:
         raise HTTPException(status_code=400, detail="Failed to create business")
+    try:
+        from holidays.holiday_engine import seed_default_holidays
+
+        seed_default_holidays(str(row["id"]))
+    except Exception as e:
+        logging.warning("[HOLIDAY] default seed skipped for business=%s error=%s", row.get("id"), e)
     return row
 
 
@@ -826,7 +1043,16 @@ def get_call_transcript(room_id: str):
 
 
 @app.get("/api/calls/{room_id}")
-def get_call(room_id: str):
+def get_call(
+    room_id: str,
+    business_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    if room_id == "inbound":
+        if not business_id:
+            raise HTTPException(status_code=400, detail="business_id is required for inbound calls")
+        return _success(db.get_inbound_calls(business_id, limit=limit, offset=offset))
     row = db.get_call_by_room(room_id)
     if not row:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -890,6 +1116,14 @@ async def trigger_call(body: TriggerCallBody):
     db.upsert_active_call(room_id, phone, body.campaign_id, body.agent_id, body.business_id, body.sip_trunk_id, "active")
 
     return {"room_id": room_id, "status": "dispatched"}
+
+
+@app.post("/api/calls/dispatch")
+async def dispatch_call_alias(body: TriggerCallBody):
+    result = await trigger_call(body)
+    if isinstance(result, dict):
+        return _success(result)
+    return result
 
 
 @app.post("/api/calls/test-batch")
@@ -1101,6 +1335,300 @@ def analytics_cost(
     return _success(db.get_cost_report(business_id, from_date, to_date))
 
 
+# Group J: Holidays
+
+@app.get("/api/holidays")
+def get_holidays_api(business_id: str = Query(...), year: Optional[int] = Query(default=None)):
+    logging.info("[HOLIDAY] list business_id=%s year=%s", business_id, year)
+    return _success(db.get_holidays(business_id, year=year))
+
+
+@app.post("/api/holidays")
+def add_holiday_api(body: HolidayCreateBody):
+    logging.info("[HOLIDAY] add business_id=%s date=%s", body.business_id, body.date)
+    row = db.add_holiday(body.business_id, body.name, body.date, body.is_recurring, body.skip_calls)
+    if not row:
+        return _error("Failed to add holiday", 400)
+    return _success(row)
+
+
+@app.delete("/api/holidays/{id}")
+def delete_holiday_api(id: str):
+    ok = db.delete_holiday(id)
+    if not ok:
+        return _error("Holiday not found", 404)
+    return _success({"deleted": True})
+
+
+@app.post("/api/holidays/seed-defaults")
+def seed_holidays_api(body: SeedHolidaysBody):
+    from holidays.holiday_engine import seed_default_holidays
+
+    count = seed_default_holidays(body.business_id)
+    return _success({"inserted": count})
+
+
+@app.get("/api/holidays/check-today")
+def check_holiday_today_api(business_id: str = Query(...)):
+    from holidays.holiday_engine import is_holiday_today
+
+    is_holiday, name = is_holiday_today(business_id)
+    return _success({"is_holiday": is_holiday, "name": name or None})
+
+
+# Group J: Number health
+
+@app.get("/api/sip-trunks/{id}/number-health")
+async def trunk_number_health(id: str):
+    return _success(db.get_number_health(id))
+
+
+@app.post("/api/sip-trunks/{id}/number-health/{phone}/pause")
+def pause_number(id: str, phone: str):
+    ok = db.set_number_pause(id, phone, True, reason="manual_pause")
+    if not ok:
+        return _error("Number not found", 404)
+    return _success({"paused": True})
+
+
+@app.post("/api/sip-trunks/{id}/number-health/{phone}/resume")
+def resume_number(id: str, phone: str):
+    ok = db.set_number_pause(id, phone, False, reason=None)
+    if not ok:
+        return _error("Number not found", 404)
+    return _success({"paused": False})
+
+
+@app.post("/api/sip-trunks/{id}/number-health/check-all")
+async def check_all_numbers(id: str):
+    from number_health.spam_checker import check_spam_score
+
+    trunk = db.get_sip_trunk(id)
+    if not trunk:
+        return _error("SIP trunk not found", 404)
+    pool = trunk.get("number_pool") or []
+    if isinstance(pool, str):
+        try:
+            pool = json.loads(pool)
+        except Exception:
+            pool = []
+    numbers = list({*(pool or []), trunk.get("phone_number")})
+    checked = 0
+    for phone in [x for x in numbers if x]:
+        existing = next((r for r in db.get_number_health(id) if str(r.get("phone_number")) == str(phone)), {}) or {}
+        result = await check_spam_score(
+            str(phone),
+            calls_today=int(existing.get("calls_today") or 0),
+            calls_per_number_limit=int(trunk.get("calls_per_number_limit") or 50),
+        )
+        db.upsert_number_health(
+            id,
+            str(phone),
+            spam_score=int(result.get("spam_score") or 0),
+            spam_label=result.get("spam_label"),
+            is_paused=int(result.get("spam_score") or 0) >= 80,
+            pause_reason="spam_flagged" if int(result.get("spam_score") or 0) >= 80 else None,
+        )
+        checked += 1
+    return _success({"checked": checked})
+
+
+# Group J: Surveys
+
+@app.get("/api/surveys")
+def list_surveys(business_id: str = Query(...)):
+    return _success(db.get_surveys(business_id))
+
+
+@app.post("/api/surveys")
+def create_survey_api(body: SurveyCreateBody):
+    row = db.create_survey(**body.model_dump())
+    if not row:
+        return _error("Failed to create survey", 400)
+    return _success(row)
+
+
+@app.put("/api/surveys/{id}")
+def update_survey_api(id: str, body: SurveyUpdateBody):
+    row = db.update_survey(id, **body.model_dump(exclude_none=True))
+    if not row:
+        return _error("Survey not found or no updates", 404)
+    return _success(row)
+
+
+@app.delete("/api/surveys/{id}")
+def delete_survey_api(id: str):
+    ok = db.delete_survey(id)
+    if not ok:
+        return _error("Survey not found", 404)
+    return _success({"deleted": True})
+
+
+@app.get("/api/surveys/{id}/responses")
+def survey_responses_api(id: str, limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    return _success(db.get_survey_responses(id, limit=limit, offset=offset))
+
+
+@app.get("/api/surveys/{id}/stats")
+def survey_stats_api(id: str):
+    return _success(db.get_survey_stats(id))
+
+
+# Group J: Reminders
+
+@app.get("/api/bookings/{booking_id}/reminders")
+def reminders_for_booking(booking_id: str):
+    return _success(db.get_reminders_for_booking(booking_id))
+
+
+@app.delete("/api/bookings/{booking_id}/reminders")
+def cancel_booking_reminders(booking_id: str):
+    count = db.cancel_reminders_for_booking(booking_id)
+    return _success({"cancelled": count})
+
+
+@app.post("/api/bookings/{booking_id}/reminders/send-now")
+async def send_booking_reminder_now(booking_id: str):
+    reminders = db.get_reminders_for_booking(booking_id)
+    if not reminders:
+        return _error("No reminders found for booking", 404)
+    reminder = reminders[0]
+    lead = db.get_lead(str(reminder.get("lead_id"))) if reminder.get("lead_id") else None
+    campaign = db.get_campaign(str(lead.get("campaign_id"))) if lead and lead.get("campaign_id") else None
+    if not campaign:
+        return _error("Cannot resolve campaign for reminder", 400)
+    prompt = (
+        f"You are calling {(lead or {}).get('name') or 'the customer'} to remind them about their appointment. "
+        "Confirm they will attend and collect any reschedule request politely."
+    )
+    result = await dispatch_outbound_call(
+        phone=reminder.get("phone"),
+        agent_id=str(reminder.get("agent_id") or campaign.get("agent_id")),
+        sip_trunk_id=str(campaign.get("sip_trunk_id")),
+        business_id=str(reminder.get("business_id")),
+        campaign_id=str(campaign.get("id")),
+        lead_id=str(reminder.get("lead_id")) if reminder.get("lead_id") else None,
+        script_override=prompt,
+        call_attempt_number=1,
+    )
+    call_row = db.create_call(
+        lead_id=str(reminder.get("lead_id")) if reminder.get("lead_id") else None,
+        campaign_id=str(campaign.get("id")),
+        agent_id=str(reminder.get("agent_id") or campaign.get("agent_id")),
+        sip_trunk_id=str(campaign.get("sip_trunk_id")),
+        business_id=str(reminder.get("business_id")),
+        phone=reminder.get("phone"),
+        room_id=result.get("room_id"),
+        call_attempt_number=1,
+        call_direction="outbound",
+    )
+    db.update_reminder_status(str(reminder["id"]), "dispatched", call_id=str(call_row.get("id")) if call_row else None)
+    return _success({"queued": True, "reminder_id": str(reminder["id"]), "room_id": result.get("room_id")})
+
+
+# Group J: Inbound
+
+@app.post("/webhook/livekit-sip-inbound")
+async def livekit_sip_inbound_webhook(request: Request):
+    from inbound.inbound_handler import on_inbound_call_webhook
+
+    payload = await request.json()
+    return JSONResponse(content=await on_inbound_call_webhook(payload))
+
+
+@app.get("/api/analytics/inbound-stats")
+def inbound_stats_api(business_id: str = Query(...), days: int = Query(7, ge=1, le=90)):
+    return _success(db.get_inbound_stats(business_id, days=days))
+
+
+# Group J: Booking calendar
+
+@app.get("/api/bookings/calendar")
+def bookings_calendar_api(
+    business_id: str = Query(...),
+    from_date: str = Query(..., alias="from"),
+    to_date: str = Query(..., alias="to"),
+):
+    return _success(db.get_bookings_calendar(business_id, from_date, to_date))
+
+
+@app.patch("/api/bookings/{id}")
+def patch_booking(id: str, body: BookingPatchBody):
+    row = db.update_booking(id, **body.model_dump(exclude_none=True))
+    if not row:
+        return _error("Booking not found or no updates", 404)
+    if body.status == "cancelled":
+        db.cancel_reminders_for_booking(id)
+    return _success(row)
+
+
+@app.get("/api/bookings/summary")
+def booking_summary_api(business_id: str = Query(...)):
+    return _success(db.get_bookings_summary(business_id))
+
+
+# Group J: Agent Simulator
+
+@app.post("/api/simulator/start")
+async def simulator_start(body: SimulatorStartBody):
+    from simulator.agent_simulator import AgentSimulator
+
+    agent_cfg = db.get_agent(body.agent_id)
+    if not agent_cfg:
+        return _error("Agent not found", 404)
+    session_id = uuid.uuid4().hex
+    simulator = AgentSimulator(agent_cfg, lead_context=body.mock_lead or {})
+    _simulator_sessions[session_id] = {
+        "simulator": simulator,
+        "agent_id": body.agent_id,
+        "created_ts": datetime.utcnow().timestamp(),
+    }
+    return _success({"session_id": session_id, "conversation": simulator.get_conversation()})
+
+
+@app.post("/api/simulator/{session_id}/message")
+async def simulator_message(session_id: str, body: SimulatorMessageBody):
+    payload = _simulator_sessions.get(session_id)
+    if not payload:
+        return _error("Simulator session not found", 404)
+    sim = payload["simulator"]
+    handlers = []
+    response, objection = await sim.send_message(body.content, objection_handlers=handlers)
+    return _success(
+        {
+            "response": response,
+            "turn_number": len(sim.get_conversation()),
+            "objection_triggered": bool(objection),
+        }
+    )
+
+
+@app.get("/api/simulator/{session_id}/conversation")
+def simulator_conversation(session_id: str):
+    payload = _simulator_sessions.get(session_id)
+    if not payload:
+        return _error("Simulator session not found", 404)
+    return _success(payload["simulator"].get_conversation())
+
+
+@app.post("/api/simulator/{session_id}/reset")
+def simulator_reset(session_id: str):
+    payload = _simulator_sessions.get(session_id)
+    if not payload:
+        return _error("Simulator session not found", 404)
+    payload["simulator"].reset()
+    payload["created_ts"] = datetime.utcnow().timestamp()
+    return _success({"reset": True})
+
+
+@app.delete("/api/simulator/{session_id}")
+def simulator_delete(session_id: str):
+    existed = _simulator_sessions.pop(session_id, None)
+    if not existed:
+        return _error("Simulator session not found", 404)
+    return _success({"deleted": True})
+
+
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await ws.accept()
@@ -1179,7 +1707,32 @@ async def whatsapp_webhook(request: Request):
         if row:
             logging.info("[WHATSAPP] STOP received and added to DNC phone=%s business_id=%s", phone, business_id)
             return _success({"dnc_added": True, "phone": phone})
-    return _success({"dnc_added": False})
+    try:
+        from surveys.survey_engine import handle_incoming_survey_response
+
+        handled = await handle_incoming_survey_response(phone, str(text))
+        if handled:
+            return _success({"dnc_added": False, "survey_response_recorded": True})
+    except Exception as e:
+        logging.warning("[WHATSAPP] survey response parse failed: %s", e)
+    return _success({"dnc_added": False, "survey_response_recorded": False})
+
+
+@app.post("/webhook/sms")
+async def sms_webhook(request: Request):
+    payload = await request.json()
+    phone = _normalize_phone(str(payload.get("phone") or payload.get("from") or ""))
+    if phone and not phone.startswith("+"):
+        phone = f"+{phone}"
+    message = str(payload.get("message") or payload.get("text") or "")
+    try:
+        from surveys.survey_engine import handle_incoming_survey_response
+
+        handled = await handle_incoming_survey_response(phone, message)
+        return _success({"survey_response_recorded": bool(handled)})
+    except Exception as e:
+        logging.warning("[SMS] survey webhook failed: %s", e)
+        return _success({"survey_response_recorded": False})
 
 
 def datetime_now_iso() -> str:
@@ -1190,7 +1743,66 @@ def datetime_now_iso() -> str:
 
 @app.get("/health")
 def health():
-    return JSONResponse({"status": "ok"})
+    return _success({"status": "ok", "timestamp": datetime_now_iso()})
+
+
+@app.get("/health/live")
+def liveness_check():
+    return _success({"alive": True, "timestamp": datetime_now_iso()})
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    checks = {"db": "ok", "redis": "warn", "livekit": "ok"}
+    status_code = 200
+    status = "ready"
+
+    # DB check (critical)
+    try:
+        conn = db.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        finally:
+            db.release_conn(conn)
+    except Exception as e:
+        checks["db"] = f"fail: {e}"
+        status = "unhealthy"
+        status_code = 503
+
+    # Redis check (optional)
+    try:
+        if os.environ.get("REDIS_URL"):
+            from cache.redis_cache import get_redis
+
+            r = await get_redis()
+            await r.ping()
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "warn"
+    except Exception:
+        checks["redis"] = "warn"
+
+    # LiveKit config check (critical)
+    if not os.environ.get("LIVEKIT_URL"):
+        checks["livekit"] = "fail"
+        status = "unhealthy"
+        status_code = 503
+
+    if status != "unhealthy" and checks["redis"] == "warn":
+        status = "degraded"
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "data": {
+                "status": status,
+                "checks": checks,
+                "timestamp": datetime_now_iso(),
+            },
+            "error": None,
+        },
+    )
 
 
 if __name__ == "__main__":

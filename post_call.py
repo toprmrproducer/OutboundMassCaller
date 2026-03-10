@@ -165,6 +165,19 @@ Return ONLY valid JSON. No markdown.
                 else:
                     logging.error("[POST-CALL] WhatsApp send failed for room_id=%s", room_id)
 
+        # Trigger post-call survey (non-blocking)
+        try:
+            if business_id:
+                business = db.get_business(str(business_id))
+            else:
+                business = None
+            if business and call_row:
+                from surveys.survey_engine import trigger_survey_for_call
+
+                await trigger_survey_for_call(call_row, lead or {}, business)
+        except Exception as survey_err:
+            logging.warning("[POST-CALL] Survey scheduling failed for room_id=%s error=%s", room_id, survey_err)
+
         logging.info(f"[POST-CALL] Completed: {room_id} | disposition={disposition} | cost=${estimated_cost:.4f}")
 
     except Exception as e:

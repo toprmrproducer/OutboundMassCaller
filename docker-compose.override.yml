@@ -1,0 +1,8 @@
+version: '3.9'
+
+services:
+  app:
+    environment:
+      LOG_FORMAT: text
+      LOG_LEVEL: DEBUG
+    command: uvicorn server:app --reload --host 0.0.0.0 --port 8000
